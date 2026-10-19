@@ -120,12 +120,16 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(
                 [str(p) for p in dep.code_files(src)], ["wllharvest.py", "web/index.html", "web/vendor/lib.js"]
             )
-            self.assertTrue(dep.install_code(src, code))
+            self.assertEqual(dep.install_code(src, code), ["wllharvest.py", "web/index.html", "web/vendor/lib.js"])
             self.assertEqual((code / "web" / "vendor" / "lib.js").read_text(), "lib\n")
             self.assertEqual((code / "wllharvest.py").stat().st_mode & 0o777, 0o644)
-            self.assertFalse(dep.install_code(src, code))  # nothing changed: no restart needed
+            self.assertEqual(dep.install_code(src, code), [])  # nothing changed: no restart needed
             (src / "web" / "index.html").write_text("<p>v2</p>\n")
-            self.assertTrue(dep.install_code(src, code))
+            changed = dep.install_code(src, code)
+            self.assertEqual(changed, ["web/index.html"])
+            self.assertFalse(dep.needs_restart(changed))  # served from disk: takes effect at once
+            (src / "wllharvest.py").write_text("print('v2')\n")
+            self.assertTrue(dep.needs_restart(dep.install_code(src, code)))
             self.assertEqual(
                 sorted(p.name for p in code.rglob("*")), ["index.html", "lib.js", "vendor", "web", "wllharvest.py"]
             )

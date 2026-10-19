@@ -32,6 +32,34 @@
     },
   };
 
+  // Display units. The data arrive in SI; US customary is the default and the
+  // choice is remembered in this browser.
+  const UNITS = {
+    us: {
+      temp: { unit: "°F", conv: (c) => c * 1.8 + 32, digits: 1 },
+      wind: { unit: "mph", conv: (ms) => ms / 0.44704, digits: 1 },
+      rain: { unit: "in", conv: (mm) => mm / 25.4, digits: 2 },
+      rate: { unit: "in/h", conv: (mmh) => mmh / 25.4, digits: 2 },
+      press: { unit: "inHg", conv: (hpa) => hpa / 33.8638866667, digits: 2 },
+    },
+    si: {
+      temp: { unit: "°C", conv: (c) => c, digits: 1 },
+      wind: { unit: "m/s", conv: (ms) => ms, digits: 1 },
+      rain: { unit: "mm", conv: (mm) => mm, digits: 1 },
+      rate: { unit: "mm/h", conv: (mmh) => mmh, digits: 1 },
+      press: { unit: "hPa", conv: (hpa) => hpa, digits: 1 },
+    },
+  };
+  let units = store.get("wx-units") === "si" ? "si" : "us";
+  const U = (kind) => UNITS[units][kind];
+  const cv = (kind, v) => (v == null ? null : U(kind).conv(v));
+  const cvs = (kind, arr) => arr.map((v) => cv(kind, v));
+  const show = (kind, v) => fmt(cv(kind, v), U(kind).digits);
+  const otherTemp = (c) => {
+    const o = UNITS[units === "us" ? "si" : "us"].temp;
+    return `${fmt(c == null ? null : o.conv(c), 0)} ${o.unit}`;
+  };
+
   async function getJSON(url) {
     const r = await fetch(url, { cache: "no-store" });
     if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
@@ -87,20 +115,20 @@
       const dir = iss.wind_dir_scalar_avg_last_2_min;
       const trend = baro.bar_trend_hpa;
       const arrow = trend == null ? "" : trend > 0.5 ? "↑ " : trend < -0.5 ? "↓ " : "→ ";
-      const tempF = iss.temp_c == null ? null : iss.temp_c * 1.8 + 32;
+      const t = U("temp").unit;
       $("#tiles").replaceChildren(
-        tile("Temperature", fmt(iss.temp_c), "°C", `${fmt(tempF, 0)} °F · dew point ${fmt(iss.dew_point_c)} °C`),
-        tile("Humidity", fmt(iss.hum, 0), "%", `feels like ${fmt(iss.thw_index_c)} °C`),
+        tile("Temperature", show("temp", iss.temp_c), t, `${otherTemp(iss.temp_c)} · dew point ${show("temp", iss.dew_point_c)} ${t}`),
+        tile("Humidity", fmt(iss.hum, 0), "%", `feels like ${show("temp", iss.thw_index_c)} ${t}`),
         tile(
           "Wind (2-min avg)",
-          fmt(wind),
-          "m/s",
-          `${wind ? `${compass(dir)} ${fmt(dir, 0)}°` : "calm"} · 10-min gust ${fmt(iss.wind_speed_hi_last_10_min_ms)}`,
+          show("wind", wind),
+          U("wind").unit,
+          `${wind ? `${compass(dir)} ${fmt(dir, 0)}°` : "calm"} · 10-min gust ${show("wind", iss.wind_speed_hi_last_10_min_ms)}`,
         ),
-        tile("Rain today", fmt(iss.rainfall_daily_mm), "mm", `rate ${fmt(iss.rain_rate_last_mmh)} mm/h`),
-        tile("Pressure", fmt(baro.bar_sea_level_hpa), "hPa", `${arrow}${fmt(trend)} hPa in 3 h`),
+        tile("Rain today", show("rain", iss.rainfall_daily_mm), U("rain").unit, `rate ${show("rate", iss.rain_rate_last_mmh)} ${U("rate").unit}`),
+        tile("Pressure", show("press", baro.bar_sea_level_hpa), U("press").unit, `${arrow}${show("press", trend)} ${U("press").unit} in 3 h`),
         tile("Sunshine", fmt(iss.solar_rad, 0), "W/m²", `UV index ${fmt(iss.uv_index)}`),
-        tile("Indoors", fmt(inside.temp_in_c), "°C", `${fmt(inside.hum_in, 0)} % humidity`),
+        tile("Indoors", show("temp", inside.temp_in_c), t, `${fmt(inside.hum_in, 0)} % humidity`),
       );
     } catch (e) {
       setStatus(`Cannot reach the weather service: ${e.message}`, true);
@@ -133,11 +161,11 @@
       }
       p.replaceChildren(
         "Today: high ",
-        el("b", null, `${fmt(hi)} °C`),
+        el("b", null, `${show("temp", hi)} ${U("temp").unit}`),
         ` at ${clock(hiAt)} · low `,
-        el("b", null, `${fmt(lo)} °C`),
+        el("b", null, `${show("temp", lo)} ${U("temp").unit}`),
         ` at ${clock(loAt)} · strongest gust `,
-        el("b", null, `${fmt(gust)} m/s`),
+        el("b", null, `${show("wind", gust)} ${U("wind").unit}`),
         ` at ${clock(gustAt)} (10-minute periods starting at those times)`,
       );
     } catch (e) {
@@ -167,8 +195,8 @@
     const whole = (u, v) => fmt(v, 0);
     return [
       {
-        title: "Temperature (°C): range and mean, with dew point",
-        data: [d.temp_c_min, d.temp_c_max, d.temp_c_mean, d.dew_point_c_mean],
+        title: `Temperature (${U("temp").unit}): range and mean, with dew point`,
+        data: [cvs("temp", d.temp_c_min), cvs("temp", d.temp_c_max), cvs("temp", d.temp_c_mean), cvs("temp", d.dew_point_c_mean)],
         series: [
           line("min", css("--temp-edge"), { width: 1 }),
           line("max", css("--temp-edge"), { width: 1 }),
@@ -184,9 +212,9 @@
         y: { range: [0, 100] },
       },
       {
-        title: "Wind (m/s): mean, gust and direction",
+        title: `Wind (${U("wind").unit}): mean, gust and direction`,
         height: 200,
-        data: [d.wind_ms_mean, gust, d.wind_vec_dir_deg],
+        data: [cvs("wind", d.wind_ms_mean), cvs("wind", gust), d.wind_vec_dir_deg],
         series: [
           line("mean", css("--wind"), { width: 2 }),
           line("gust", css("--gust"), { width: 1 }),
@@ -209,8 +237,8 @@
         },
       },
       {
-        title: `Rain (mm): per ${STEP_NAME[d.step]} and accumulated over the range`,
-        data: [d.rain_mm, rainSum],
+        title: `Rain (${U("rain").unit}): per ${STEP_NAME[d.step]} and accumulated over the range`,
+        data: [cvs("rain", d.rain_mm), cvs("rain", rainSum)],
         series: [
           line(`per ${STEP_NAME[d.step]}`, css("--rain"), {
             width: 0,
@@ -218,15 +246,15 @@
             paths: uPlot.paths.bars({ size: [0.8, 40] }),
             value: (u, v) => fmt(v, 2),
           }),
-          line("accumulated", css("--rain-sum"), { scale: "sum" }),
+          line("accumulated", css("--rain-sum"), { scale: "sum", value: (u, v) => fmt(v, 2) }),
         ],
         y: { range: fromZero },
         right: { scale: "sum", range: fromZero },
       },
       {
-        title: "Sea-level pressure (hPa)",
-        data: [d.slp_hpa_mean],
-        series: [line("pressure", css("--press"))],
+        title: `Sea-level pressure (${U("press").unit})`,
+        data: [cvs("press", d.slp_hpa_mean)],
+        series: [line("pressure", css("--press"), { value: (u, v) => fmt(v, U("press").digits) })],
       },
       {
         title: "Solar radiation (W/m²): range and mean, with peak UV index",
@@ -301,7 +329,7 @@
     const step = STEP[days];
     try {
       const d = await getJSON(`api/series?t0=${now - days * 86400}&t1=${now}&step=${step}&offset=${tzOffset()}`);
-      build(d, `${days}:${matchMedia("(prefers-color-scheme: dark)").matches}`);
+      build(d, `${days}:${units}:${matchMedia("(prefers-color-scheme: dark)").matches}`);
       $("#range-note").textContent = `${STEP_NAME[step]} values, local time`;
     } catch (e) {
       setStatus(`Cannot load charts: ${e.message}`, true);
@@ -309,12 +337,24 @@
     chartTimer = setTimeout(refreshCharts, days === "1" ? 60_000 : 600_000);
   }
 
-  for (const b of document.querySelectorAll(".ranges button")) {
+  for (const b of document.querySelectorAll("button[data-days]")) {
     b.setAttribute("aria-pressed", String(b.dataset.days === days));
     b.addEventListener("click", () => {
       days = b.dataset.days;
       store.set("wx-days", days);
-      for (const x of document.querySelectorAll(".ranges button")) x.setAttribute("aria-pressed", String(x === b));
+      for (const x of document.querySelectorAll("button[data-days]")) x.setAttribute("aria-pressed", String(x === b));
+      refreshCharts();
+    });
+  }
+
+  for (const b of document.querySelectorAll("button[data-units]")) {
+    b.setAttribute("aria-pressed", String(b.dataset.units === units));
+    b.addEventListener("click", () => {
+      units = b.dataset.units;
+      store.set("wx-units", units);
+      for (const x of document.querySelectorAll("button[data-units]")) x.setAttribute("aria-pressed", String(x === b));
+      refreshLatest();
+      refreshToday();
       refreshCharts();
     });
   }

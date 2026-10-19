@@ -131,9 +131,9 @@ def code_files(src_root: Path) -> list[Path]:
     return [Path("wllharvest.py"), *extra, *web]
 
 
-def install_code(src_root: Path, code_dir: Path) -> bool:
-    """Atomically install code_files() into code_dir; True if any changed."""
-    changed = False
+def install_code(src_root: Path, code_dir: Path) -> list[str]:
+    """Atomically install code_files() into code_dir; returns the paths that changed."""
+    changed: list[str] = []
     for rel in code_files(src_root):
         new, target = (src_root / rel).read_bytes(), code_dir / rel
         if target.exists() and target.read_bytes() == new:
@@ -143,8 +143,14 @@ def install_code(src_root: Path, code_dir: Path) -> bool:
         tmp.write_bytes(new)
         os.chmod(tmp, 0o644)
         os.replace(tmp, target)
-        changed = True
+        changed.append(str(rel))
     return changed
+
+
+def needs_restart(changed: list[str]) -> bool:
+    """Only a new wllharvest.py needs the containers restarted: web/ files are
+    read from disk on every request, and Traefik watches traefik.yml."""
+    return "wllharvest.py" in changed
 
 
 def deploy_app(c: Any, app: str, compose: str, code_changed: bool) -> str:
@@ -234,10 +240,11 @@ def main() -> None:
         if user:
             print(f"read access for uid {user[0]}: {grant_read(c, mnt, user[0])}")
 
-        code_changed = install_code(HERE, code)
+        changed = install_code(HERE, code)
+        code_changed = needs_restart(changed)
         restrict(code, 0, 0, 0o755, 0o644)  # root-owned: no other local user can change what runs
         target = code / "wllharvest.py"
-        print(f"code in {code}: {'updated' if code_changed else 'unchanged'}; data in {data}")
+        print(f"code in {code}: {', '.join(changed) + ' updated' if changed else 'unchanged'}; data in {data}")
 
         probe, st_file = data / ".write_probe", data / "status.json"
         checks = [

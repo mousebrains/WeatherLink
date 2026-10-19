@@ -121,6 +121,7 @@ h1 { margin: 0; font-size: 22px; }
 
 .ranges button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 .range-note { font-size: 12px; color: var(--muted); }
+.units { margin-left: auto; display: inline-flex; gap: 6px; }
 
 .panel {
   background: var(--panel);

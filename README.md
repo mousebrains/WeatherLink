@@ -137,6 +137,10 @@ Don't forward the port to the internet.
   * solar radiation as a band, with peak UV
   * data quality: polls answered and link synced
 
+Units default to US customary (°F, mph, inches, inHg), and a toggle switches to metric
+(°C, m/s, mm, hPa); each browser remembers its choice. Only the display converts: the
+database, the CSV downloads and the API stay in SI units.
+
 Missing data shows as gaps. The page follows the browser's light or dark setting,
 works at phone width, and needs no internet access. Its chart library,
 [uPlot](https://github.com/leeoniya/uPlot) 1.6.32 (MIT), is served from `web/vendor/`.
