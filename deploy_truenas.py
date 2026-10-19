@@ -22,6 +22,8 @@ import argparse
 import datetime as dt
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +37,8 @@ HERE = Path(__file__).resolve().parent
 APPS_ID = 568  # TrueNAS 'apps' user and group
 PLACEHOLDER = "/mnt/POOL/apps/wllharvest"  # host paths in compose.yaml to replace
 VOLUMES = {f"{PLACEHOLDER}/code:/app:ro": "code", f"{PLACEHOLDER}/data:/data": "data"}
+OPTIONAL_VOLUMES = {f"{PLACEHOLDER}/certs:/certs:ro": "certs"}  # the proxy's certificate
+CERT_JOB = "wllharvest: copy the weather TLS certificate to the proxy"
 
 
 def can(uid: int, gid: int, *cmd: str) -> bool:
@@ -49,11 +53,56 @@ def can(uid: int, gid: int, *cmd: str) -> bool:
 
 def fill_paths(compose: str, mnt: Path) -> str:
     """compose.yaml with its placeholder host paths pointed into the dataset."""
-    for v, sub in VOLUMES.items():
+    for v in VOLUMES:
         if f"- {v}" not in compose:
             raise ValueError(f"compose.yaml must mount {v}")
+    for v, sub in {**VOLUMES, **OPTIONAL_VOLUMES}.items():
         compose = compose.replace(v, v.replace(f"{PLACEHOLDER}/{sub}", str(mnt / sub)))
     return compose
+
+
+def restrict(path: Path, uid: int, gid: int, dir_mode: int, file_mode: int) -> None:
+    """Make path (recursively) plainly owned, with no inherited ACL entries:
+    the APPS dataset preset grants builtin_users read-write to everything."""
+    if shutil.which("nfs4xdr_setfacl"):
+        subprocess.run(["nfs4xdr_setfacl", "-R", "-b", str(path)], capture_output=True, check=False)
+    for p in [path, *path.rglob("*")]:
+        os.chown(p, uid, gid)
+        os.chmod(p, dir_mode if p.is_dir() else file_mode)
+
+
+def cert_sync_command(crt: str, key: str, dest: Path, app: str, owner: int = APPS_ID, group: int = APPS_ID) -> str:
+    """Shell command for a root cron job: when TrueNAS's certificate files
+    differ from the proxy's copies, replace the copies atomically (temp file,
+    then rename) and restart only the proxy, which reads them at start."""
+    c, k = shlex.quote(crt), shlex.quote(key)
+    dc, dk = shlex.quote(str(dest / "weather.crt")), shlex.quote(str(dest / "weather.key"))
+    copy = f"install -o {owner} -g {group} -m 0400"
+    proxy = f"docker ps -q -f label=com.docker.compose.project=ix-{app} -f label=com.docker.compose.service=proxy"
+    return (
+        f"cmp -s {c} {dc} && cmp -s {k} {dk} || {{ "
+        f"{copy} {c} {dc}.new && {copy} {k} {dk}.new && mv -f {dc}.new {dc} && mv -f {dk}.new {dk} && "
+        f'ids=$({proxy}) && {{ [ -z "$ids" ] || docker restart $ids; }}; }}'
+    )
+
+
+def ensure_cron(c: Any, command: str, description: str = CERT_JOB) -> str:
+    """Create or update the daily root cron job running command."""
+    data = {
+        "command": command,
+        "description": description,
+        "user": "root",
+        "enabled": True,
+        "schedule": {"minute": "17", "hour": "3", "dom": "*", "month": "*", "dow": "*"},
+    }
+    jobs = c.call("cronjob.query", [["description", "=", description]])
+    if not jobs:
+        c.call("cronjob.create", data)
+        return "created"
+    if jobs[0]["command"] == command and jobs[0]["enabled"]:
+        return "unchanged"
+    c.call("cronjob.update", jobs[0]["id"], data)
+    return "updated"
 
 
 def grant_read(c: Any, path: Path, uid: int) -> str:
@@ -75,10 +124,11 @@ def grant_read(c: Any, path: Path, uid: int) -> str:
 
 
 def code_files(src_root: Path) -> list[Path]:
-    """What the containers run, relative to src_root: the harvester and the
-    dashboard's web directory."""
+    """What the containers run, relative to src_root: the harvester, the
+    proxy's configuration and the dashboard's web directory."""
     web = sorted(p.relative_to(src_root) for p in (src_root / "web").rglob("*") if p.is_file())
-    return [Path("wllharvest.py"), *web]
+    extra = [Path("traefik.yml")] if (src_root / "traefik.yml").exists() else []
+    return [Path("wllharvest.py"), *extra, *web]
 
 
 def install_code(src_root: Path, code_dir: Path) -> bool:
@@ -152,6 +202,7 @@ def main() -> None:
     p.add_argument("--dataset", default="SSD/WeatherLink")
     p.add_argument("--app", default="wllharvest")
     p.add_argument("--wait", type=float, default=120, help="s to wait for fresh data")
+    p.add_argument("--cert", default="Weather", help="TrueNAS certificate for the proxy (default Weather)")
     p.add_argument(
         "--no-app", action="store_true", help="only set up the dataset, permissions and code; leave the app untouched"
     )
@@ -184,6 +235,7 @@ def main() -> None:
             print(f"read access for uid {user[0]}: {grant_read(c, mnt, user[0])}")
 
         code_changed = install_code(HERE, code)
+        restrict(code, 0, 0, 0o755, 0o644)  # root-owned: no other local user can change what runs
         target = code / "wllharvest.py"
         print(f"code in {code}: {'updated' if code_changed else 'unchanged'}; data in {data}")
 
@@ -203,6 +255,19 @@ def main() -> None:
             print(f"  {'ok  ' if ok else 'FAIL'} {what}{'' if ok or required else ' (not required)'}")
         if not all(ok for _, required, ok in checks if required):
             sys.exit("permission check failed; app not installed or changed")
+
+        if "proxy" in yaml.safe_load(compose)["services"]:
+            certs = mnt / "certs"
+            certs.mkdir(exist_ok=True)
+            restrict(certs, APPS_ID, APPS_ID, 0o700, 0o400)  # only the proxy (and root) can read the key
+            cert = c.call("certificate.query", [["name", "=", a.cert]])
+            if cert and cert[0].get("certificate_path") and cert[0].get("privatekey_path"):
+                command = cert_sync_command(cert[0]["certificate_path"], cert[0]["privatekey_path"], certs, a.app)
+                subprocess.run(["sh", "-c", command], check=False)
+                print(f"certificate {a.cert!r} copied to {certs}; daily copy job {ensure_cron(c, command)}")
+            else:
+                print(f"WARNING: no TrueNAS certificate named {a.cert!r} yet; the proxy serves a self-signed")
+                print("         certificate until it exists and this script is run again")
 
         if a.no_app:
             print("--no-app: app left untouched")

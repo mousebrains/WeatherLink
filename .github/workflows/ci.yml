@@ -77,6 +77,7 @@ jobs:
           {
             echo "WLL_CI_CODE=$GITHUB_WORKSPACE"
             echo "WLL_CI_DATA=$RUNNER_TEMP/wll-data"
+            echo "WLL_CI_CERTS=$RUNNER_TEMP/wll-certs"
             echo "COMPOSE=docker compose -f compose.yaml -f tests/compose.ci.yaml"
           } >> "$GITHUB_ENV"
       - name: Validate compose.yaml
@@ -85,12 +86,34 @@ jobs:
         run: |
           nohup python tools/fake_wll.py --bind 127.0.0.1 --port 18080 \
             --udp-target 127.0.0.1:22222 > "$RUNNER_TEMP/fake_wll.log" 2>&1 &
-      - name: Start the app (harvester + web, as the apps user 568)
+      - name: Self-signed certificate for the proxy
+        run: |
+          mkdir -p "$WLL_CI_CERTS"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=weather.mousebrains.com" \
+            -addext "subjectAltName=DNS:weather.mousebrains.com" \
+            -keyout "$WLL_CI_CERTS/weather.key" -out "$WLL_CI_CERTS/weather.crt"
+          chmod 644 "$WLL_CI_CERTS"/*   # CI only: the deployed key is 0400, owned by 568
+      - name: Start the app (harvester, web and proxy, as the apps user 568)
         run: |
           mkdir -p "$WLL_CI_DATA" && chmod 777 "$WLL_CI_DATA"
           $COMPOSE up -d
       - name: Check polls, summaries and the CSV service
         run: python tests/smoke_container.py --data-dir "$WLL_CI_DATA" --web http://127.0.0.1:8580 --timeout 120
+      - name: Check the HTTPS proxy
+        run: |
+          https="curl -fsS --cacert $WLL_CI_CERTS/weather.crt --resolve weather.mousebrains.com:18443:127.0.0.1"
+          $https https://weather.mousebrains.com:18443/ | grep -q uPlot && echo "ok   dashboard over HTTPS"
+          $https https://weather.mousebrains.com:18443/api/latest \
+            | python -c "import json, sys; assert json.load(sys.stdin)['iss']['temp_c'] is not None" \
+            && echo "ok   API over HTTPS"
+          redirect=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+            -H 'Host: weather.mousebrains.com' http://127.0.0.1:18081/api/latest)
+          echo "http -> $redirect"
+          case "$redirect" in 30[178]\ https://weather.mousebrains.com/api/latest) echo "ok   HTTP redirects to HTTPS" ;; *) exit 1 ;; esac
+          echo | openssl s_client -connect 127.0.0.1:18443 -servername weather.mousebrains.com 2>/dev/null \
+            | openssl x509 -noout -subject | grep -q weather.mousebrains.com && echo "ok   certificate from /certs"
+          $COMPOSE exec -T proxy traefik healthcheck --ping --entrypoints.traefik.address=127.0.0.1:8082 \
+            && echo "ok   proxy health check"
       - name: Stop and check for a clean shutdown
         run: |
           $COMPOSE stop

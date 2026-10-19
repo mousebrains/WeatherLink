@@ -173,7 +173,7 @@ Copy the files to the NAS and run the install script with `sudo`. It runs on the
 NAS's own Python (3.11 on TrueNAS 25.10) and uses the TrueNAS API.
 
 ```sh
-scp -r wllharvest.py web compose.yaml deploy_truenas.py nas0:wllharvest/
+scp -r wllharvest.py web traefik.yml compose.yaml deploy_truenas.py nas0:wllharvest/
 ssh -t nas0 'sudo python3 ~/wllharvest/deploy_truenas.py'   # defaults: --dataset SSD/WeatherLink --app wllharvest
 ```
 
@@ -203,6 +203,34 @@ replacing `/mnt/POOL/apps/wllharvest`.
 
 **On a VM or any Linux host:** use `wllharvest.service` and
 `wllharvest-web.service`. Their header comments list the commands.
+
+### HTTPS at `weather.mousebrains.com`
+
+The `proxy` container ([Traefik](https://traefik.io), official image) serves the dashboard at
+`https://weather.mousebrains.com`, and redirects plain HTTP to HTTPS.
+
+* **Its own address.** The proxy sits on a Docker *macvlan* network with its own MAC
+  (`02:57:4c:4c:00:01`) and address (172.22.222.47, a UniFi reservation). That matters
+  because TrueNAS's web interface holds ports 80 and 443 on the NAS's own address.
+  `tools/dhcp_probe.sh` (run with `sudo`) asks the DHCP server for a lease for that MAC,
+  so the router can pin it. One limit: Linux keeps a host and its macvlan containers
+  apart, so the NAS itself can't open `weather.mousebrains.com`; every other machine on
+  the LAN can. `web` sits on a private bridge network shared with the proxy, and is
+  still published on the NAS at port 8580.
+* **The certificate.** The certificate comes from TrueNAS's own ACME service. Create it
+  under Credentials → Certificates, named `Weather` (`--cert` selects another), with the same Cloudflare DNS
+  authenticator as the NAS's own certificate. The app holds no DNS API token.
+  `deploy_truenas.py` copies the certificate into `<dataset>/certs`, with mode 0400,
+  owned by the apps user, and with inherited ACL entries stripped. It also registers a
+  daily root cron job (03:17) that copies the files again when TrueNAS renews them, and
+  then restarts only the proxy. Until the certificate exists, Traefik serves a
+  self-signed one.
+* **Locking down the code.** `deploy_truenas.py` also strips the inherited ACL from
+  `<dataset>/code` and makes it root-owned. The APPS dataset preset grants
+  `builtin_users` read-write, so without this any local user could change what the
+  containers run.
+* **Moving it.** The site-specific values live in `compose.yaml` (`lan`: parent
+  interface, subnet, gateway, address) and `traefik.yml` (host name).
 
 ## Configuration
 
@@ -295,10 +323,12 @@ python3 wllharvest.py status --data-dir ./range1 --hours 1             # % synce
 ```
 wllharvest.py               harvester, summaries, web server, CLI (Python ≥ 3.13, standard library only)
 web/                        dashboard page, script and styles; vendored uPlot
-compose.yaml                Docker / TrueNAS app: harvester + web containers
+compose.yaml                Docker / TrueNAS app: harvester, web and proxy containers
+traefik.yml                 proxy routing and certificate paths
 deploy_truenas.py           TrueNAS install/upgrade via its API (runs on the NAS's Python 3.11)
 wllharvest*.service         systemd units for a VM
 tools/fake_wll.py           simulated WLL with fault injection
+tools/dhcp_probe.sh         asks the DHCP server for a lease for the proxy's MAC (run once)
 tests/                      unit, end-to-end, install-script and container smoke tests
 pyproject.toml              ruff and mypy settings
 .github/workflows/ci.yml    CI: lint, types, tests, container smoke test
@@ -325,7 +355,7 @@ running. They also check the ACL grant and the path substitution.
 | lint | `ruff check` and `ruff format --check`; `mypy` on the 3.13 code, with every shipped function annotated; `mypy --python-version 3.11 deploy_truenas.py` |
 | test | the unit and end-to-end tests on Python 3.13 and 3.14 (Linux) |
 | deploy-script | the install-script tests on Python 3.11, the TrueNAS host's version |
-| container | validates `compose.yaml`, then runs the real app on `python:3.13-slim` as user 568 against the simulator. It checks polls, summaries, the CSV and health endpoints, and a clean shutdown. |
+| container | validates `compose.yaml`, then runs the real app (harvester and web on `python:3.13-slim`, proxy on `traefik:v3.7`, as user 568) against the simulator, with the proxy on ordinary networking and a self-signed certificate. It checks polls, summaries, the dashboard and API, HTTPS through the proxy, the HTTP→HTTPS redirect, the health checks, and a clean shutdown. |
 
 The weekly run catches changes to the floating `python:3.13-slim` image before a
 TrueNAS redeploy pulls it.

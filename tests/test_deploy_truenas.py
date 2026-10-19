@@ -5,6 +5,8 @@ which TrueNAS ships:  python3 -m unittest discover -s tests -p 'test_deploy*'
 """
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -45,9 +47,9 @@ class FakeClient:
 class DeployTests(unittest.TestCase):
     def test_fill_paths_points_both_services_into_the_dataset(self) -> None:
         services = yaml.safe_load(dep.fill_paths(COMPOSE, MNT))["services"]
-        self.assertEqual(set(services), {"wllharvest", "web"})
-        for svc in services.values():
-            self.assertEqual(svc["volumes"], [f"{MNT}/code:/app:ro", f"{MNT}/data:/data"])
+        self.assertEqual(set(services), {"wllharvest", "web", "proxy"})
+        for name in ("wllharvest", "web"):
+            self.assertEqual(services[name]["volumes"], [f"{MNT}/code:/app:ro", f"{MNT}/data:/data"])
         with self.assertRaises(ValueError):
             dep.fill_paths(COMPOSE.replace(f"{dep.PLACEHOLDER}/data:/data", "/elsewhere:/data"), MNT)
 
@@ -145,6 +147,77 @@ class DeployTests(unittest.TestCase):
             status["udp"] = {"enabled": True, "packets": 0}
             path.write_text(json.dumps(status))
             self.assertFalse(dep.wait_fresh(path, t_start, False, wait=0.2, every=0.05)[1])  # UDP pending
+
+    def test_fill_paths_covers_the_proxy_certificates(self) -> None:
+        services = yaml.safe_load(dep.fill_paths(COMPOSE, MNT))["services"]
+        self.assertEqual(services["proxy"]["volumes"], [f"{MNT}/code:/app:ro", f"{MNT}/certs:/certs:ro"])
+        self.assertFalse([v for s in services.values() for v in s.get("volumes", []) if "/mnt/POOL" in v])
+
+    def test_proxy_network_is_consistent(self) -> None:
+        c = yaml.safe_load(COMPOSE)
+        lan = c["services"]["proxy"]["networks"]["lan"]
+        ipam = c["networks"]["lan"]["ipam"]["config"][0]
+        self.assertEqual(ipam["ip_range"], f"{lan['ipv4_address']}/32")
+        self.assertTrue(int(lan["mac_address"].split(":")[0], 16) & 0b10)  # locally administered
+        self.assertNotIn("network_mode", c["services"]["web"])  # macvlan cannot reach the host network
+        traefik = yaml.safe_load((ROOT / "traefik.yml").read_text())
+        cert = traefik["tls"]["stores"]["default"]["defaultCertificate"]
+        self.assertEqual((cert["certFile"], cert["keyFile"]), ("/certs/weather.crt", "/certs/weather.key"))
+        self.assertEqual(traefik["http"]["services"]["web"]["loadBalancer"]["servers"][0]["url"], "http://web:8580")
+
+    def test_cert_sync_command_copies_only_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            src, dest, bin_ = Path(d) / "etc", Path(d) / "certs", Path(d) / "bin"
+            for p in (src, dest, bin_):
+                p.mkdir()
+            (src / "w.crt").write_text("cert 1\n")
+            (src / "w.key").write_text("key 1\n")
+            log = Path(d) / "docker.log"
+            stub = bin_ / "docker"  # records calls; "ps" finds one proxy container
+            stub.write_text(f'#!/bin/sh\necho "$@" >> {log}\n[ "$1" = ps ] && echo abc123\nexit 0\n')
+            stub.chmod(0o755)
+            cmd = dep.cert_sync_command(
+                str(src / "w.crt"), str(src / "w.key"), dest, "wllharvest", os.getuid(), os.getgid()
+            )
+            env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}")
+
+            def run() -> list[str]:
+                log.write_text("")
+                subprocess.run(["sh", "-c", cmd], env=env, check=False)
+                return log.read_text().splitlines()
+
+            calls = run()
+            self.assertEqual((dest / "weather.key").read_text(), "key 1\n")
+            self.assertEqual((dest / "weather.key").stat().st_mode & 0o777, 0o400)
+            self.assertEqual(calls[-1], "restart abc123")
+            self.assertIn("label=com.docker.compose.project=ix-wllharvest", calls[0])
+            self.assertEqual(run(), [])  # unchanged: no copy, no restart
+            (src / "w.crt").write_text("cert 2\n")  # renewed by TrueNAS
+            self.assertEqual(run()[-1], "restart abc123")
+            self.assertEqual((dest / "weather.crt").read_text(), "cert 2\n")
+            self.assertEqual(sorted(p.name for p in dest.iterdir()), ["weather.crt", "weather.key"])
+
+    def test_ensure_cron(self) -> None:
+        none = FakeClient({"cronjob.query": []})
+        self.assertEqual(dep.ensure_cron(none, "true"), "created")
+        method, (data,), _ = none.calls[-1]
+        self.assertEqual((method, data["user"], data["command"]), ("cronjob.create", "root", "true"))
+        same = FakeClient({"cronjob.query": [{"id": 7, "command": "true", "enabled": True}]})
+        self.assertEqual(dep.ensure_cron(same, "true"), "unchanged")
+        self.assertEqual(same.methods(), ["cronjob.query"])
+        old = FakeClient({"cronjob.query": [{"id": 7, "command": "false", "enabled": True}]})
+        self.assertEqual(dep.ensure_cron(old, "true"), "updated")
+        self.assertEqual(old.calls[-1][:2], ("cronjob.update", (7, old.calls[-1][1][1])))
+
+    def test_restrict_sets_plain_owner_and_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            top = Path(d) / "code"
+            (top / "web").mkdir(parents=True)
+            (top / "web" / "a.js").write_text("x")
+            dep.restrict(top, os.getuid(), os.getgid(), 0o750, 0o640)
+            self.assertEqual(top.stat().st_mode & 0o777, 0o750)
+            self.assertEqual((top / "web").stat().st_mode & 0o777, 0o750)
+            self.assertEqual((top / "web" / "a.js").stat().st_mode & 0o777, 0o640)
 
     def test_web_port(self) -> None:
         self.assertEqual(dep.web_port(COMPOSE), "8580")

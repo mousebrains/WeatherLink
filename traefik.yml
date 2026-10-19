@@ -1,0 +1,24 @@
+# Traefik dynamic configuration for the proxy container (see compose.yaml):
+# HTTPS for weather.mousebrains.com in front of the web container. The
+# certificate is TrueNAS's ACME certificate "Weather", copied into /certs by the
+# daily cron job that deploy_truenas.py registers. Until it exists, Traefik
+# serves a self-signed certificate.
+http:
+  routers:
+    weather:
+      rule: Host(`weather.mousebrains.com`)
+      entryPoints: [websecure]
+      service: web
+      tls: {}
+  services:
+    web:
+      loadBalancer:
+        servers:
+          - url: http://web:8580
+
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/weather.crt
+        keyFile: /certs/weather.key
