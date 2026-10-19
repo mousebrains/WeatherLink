@@ -1,0 +1,34 @@
+[project]
+name = "wllharvest"
+version = "1.1.0"
+description = "Local data harvester for a Davis WeatherLink Live"
+readme = "README.md"
+license = "GPL-3.0-only"
+requires-python = ">=3.13"
+dependencies = []            # standard library only
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+# deploy_truenas.py runs on the TrueNAS host's own Python (3.11 on 25.10).
+per-file-target-version = { "deploy_truenas.py" = "py311" }
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "B", "UP", "I", "SIM", "RUF", "C4", "EXE", "ISC", "PLE", "PLW"]
+ignore = ["SIM905"]   # keep the compact """a b c""".split() field lists
+
+[tool.mypy]
+python_version = "3.13"
+files = ["wllharvest.py", "tools/fake_wll.py", "tests"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["wllharvest", "deploy_truenas"]
+disallow_untyped_defs = true        # new code in the shipped modules must be annotated
+
+[[tool.mypy.overrides]]
+module = ["truenas_api_client"]     # TrueNAS-internal, not on PyPI
+ignore_missing_imports = true

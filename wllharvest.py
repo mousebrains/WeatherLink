@@ -51,14 +51,19 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
+from types import FrameType
+from typing import Any, TextIO, cast
 
-VERSION = "1.0.0"
-MIN_POLL_INTERVAL = 10.0   # documented limit for /v1/current_conditions
-MAX_RT_DURATION = 86400    # documented limit for /v1/real_time
-UDP_STALL = 30.0           # s of UDP silence before re-requesting broadcasts
-UDP_STALL_MAX = 600.0      # cap on the doubling stall wait
-HOUSEKEEPING = 60.0        # s between fsync / status / summary checks
+Json = dict[str, Any]
+
+VERSION = "1.1.0"
+MIN_POLL_INTERVAL = 10.0  # documented limit for /v1/current_conditions
+MAX_RT_DURATION = 86400  # documented limit for /v1/real_time
+UDP_STALL = 30.0  # s of UDP silence before re-requesting broadcasts
+UDP_STALL_MAX = 600.0  # cap on the doubling stall wait
+HOUSEKEEPING = 60.0  # s between fsync / status / summary checks
 
 log = logging.getLogger("wllharvest")
 
@@ -93,13 +98,17 @@ FIELDS = {
         wind_dir_at_hi_speed_last_10_min""".split(),
 }
 # (stream, data_structure_type) -> table; anything else goes to <stream>_type<N>
-TABLE_FOR = {("http", 1): "iss", ("http", 2): "soil_leaf", ("http", 3): "baro",
-             ("http", 4): "inside", ("udp", 1): "rt_iss"}
+TABLE_FOR: dict[tuple[str, Any], str] = {
+    ("http", 1): "iss",
+    ("http", 2): "soil_leaf",
+    ("http", 3): "baro",
+    ("http", 4): "inside",
+    ("udp", 1): "rt_iss",
+}
 BASE_COLS = ("recv_time", "ts", "did", "lsid")
 
 # mm per rain count, by the record's rain_size code (0.01 in, 0.2 mm, 0.1 mm, 0.001 in)
-RAIN_MM = ("(CASE rain_size WHEN 1 THEN 0.254 WHEN 2 THEN 0.2 "
-           "WHEN 3 THEN 0.1 WHEN 4 THEN 0.0254 END)")
+RAIN_MM = "(CASE rain_size WHEN 1 THEN 0.254 WHEN 2 THEN 0.2 WHEN 3 THEN 0.1 WHEN 4 THEN 0.0254 END)"
 CONVERT = {  # native unit -> (column suffix in *_si view, SQL expression)
     "degF": ("_c", "({c} - 32.0) / 1.8"),
     "mph": ("_ms", "{c} * 0.44704"),
@@ -107,14 +116,26 @@ CONVERT = {  # native unit -> (column suffix in *_si view, SQL expression)
     "count": ("_mm", "{c} * " + RAIN_MM),
     "count/h": ("_mmh", "{c} * " + RAIN_MM),
 }
-DEGF = {"temp", "dew_point", "wet_bulb", "heat_index", "wind_chill", "thw_index",
-        "thsw_index", "temp_in", "dew_point_in", "heat_index_in",
-        "temp_1", "temp_2", "temp_3", "temp_4"}
-RAIN_COUNTS = {"rain_storm", "rain_storm_last", "rain_15_min", "rain_60_min",
-               "rain_24_hr"}
+DEGF = {
+    "temp",
+    "dew_point",
+    "wet_bulb",
+    "heat_index",
+    "wind_chill",
+    "thw_index",
+    "thsw_index",
+    "temp_in",
+    "dew_point_in",
+    "heat_index_in",
+    "temp_1",
+    "temp_2",
+    "temp_3",
+    "temp_4",
+}
+RAIN_COUNTS = {"rain_storm", "rain_storm_last", "rain_15_min", "rain_60_min", "rain_24_hr"}
 
 
-def unit_of(field):
+def unit_of(field: str) -> str | None:
     """Native unit of a documented field, if the SI view must convert it."""
     if field in DEGF:
         return "degF"
@@ -126,25 +147,24 @@ def unit_of(field):
         return "count/h"
     if field.startswith("rainfall") or field in RAIN_COUNTS:
         return "count"
-    return None   # %RH, degrees, W/m2, UV index, cb, codes, epoch seconds
+    return None  # %RH, degrees, W/m2, UV index, cb, codes, epoch seconds
 
 
-def q(name):
+def q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def column_name(key):
+def column_name(key: object) -> str:
     col = re.sub(r"\W", "_", str(key), flags=re.ASCII) or "_"
     if col[0].isdigit():
         col = "_" + col
     return "rec_" + col if col in ("recv_time", "ts", "did") else col
 
 
-def si_view_sql(table):
+def si_view_sql(table: str) -> str:
     # time_utc is the host's (NTP) arrival time: the WLL's integer ts runs
     # ~0.3 s slow and truncates, so it reads 0.3-1.3 s early (see README).
-    cols = ["recv_time", "ts", "strftime('%Y-%m-%d %H:%M:%f', recv_time, 'unixepoch') AS time_utc",
-            "did", "lsid"]
+    cols = ["recv_time", "ts", "strftime('%Y-%m-%d %H:%M:%f', recv_time, 'unixepoch') AS time_utc", "did", "lsid"]
     for f in FIELDS[table]:
         kind = unit_of(f)
         if kind is None:
@@ -172,30 +192,47 @@ SUMMARY_STATS = {
     "rh_in": ("inside_si", "hum_in"),
 }
 STAT_NAMES = ("min", "mean", "median", "max")
-ISS_EXTRA = ["wind_dir_last", "rx_state", "trans_battery_flag", "rainfall_daily_mm",
-             "wind_speed_avg_last_10_min_ms", "wind_dir_scalar_avg_last_10_min",
-             "wind_speed_hi_last_10_min_ms", "wind_dir_at_hi_speed_last_10_min"]
-SUMMARY_COLS = (["time_utc", "n_polls", "n_failed", "rx_ok_frac", "battery_low", "rain_mm"]
-                + [f"{p}_{s}" for p in SUMMARY_STATS for s in STAT_NAMES]
-                + ["wind_dir_mean_deg", "wind_dir_steadiness", "n_calm", "wind_vec_ms",
-                   "wind_vec_dir_deg", "wll_wind_avg_10min_ms", "wll_wind_dir_10min_deg",
-                   "wll_gust_10min_ms", "wll_gust_dir_10min_deg"])
-RAIN_GAP = 60.0   # s; rain increments count only between samples this close
-SUMMARY_PERIOD = int(os.environ.get("WLL_SUMMARY_PERIOD") or 600)   # s
+ISS_EXTRA = [
+    "wind_dir_last",
+    "rx_state",
+    "trans_battery_flag",
+    "rainfall_daily_mm",
+    "wind_speed_avg_last_10_min_ms",
+    "wind_dir_scalar_avg_last_10_min",
+    "wind_speed_hi_last_10_min_ms",
+    "wind_dir_at_hi_speed_last_10_min",
+]
+SUMMARY_COLS = (
+    ["time_utc", "n_polls", "n_failed", "rx_ok_frac", "battery_low", "rain_mm"]
+    + [f"{p}_{s}" for p in SUMMARY_STATS for s in STAT_NAMES]
+    + [
+        "wind_dir_mean_deg",
+        "wind_dir_steadiness",
+        "n_calm",
+        "wind_vec_ms",
+        "wind_vec_dir_deg",
+        "wll_wind_avg_10min_ms",
+        "wll_wind_dir_10min_deg",
+        "wll_gust_10min_ms",
+        "wll_gust_dir_10min_deg",
+    ]
+)
+RAIN_GAP = 60.0  # s; rain increments count only between samples this close
+SUMMARY_PERIOD = int(os.environ.get("WLL_SUMMARY_PERIOD") or 600)  # s
 
 
-def summary_table(period):
+def summary_table(period: int) -> str:
     return f"summary_{period // 60}min" if period % 60 == 0 else f"summary_{period}s"
 
 
-def vector_mean(dirs, weights=None):
+def vector_mean(dirs: Sequence[float], weights: Sequence[float] | None = None) -> tuple[float | None, float | None]:
     """(direction deg, magnitude) of the mean of compass directions as vectors
     of the given lengths (unit vectors by default); (None, None) if empty."""
     if not dirs:
         return None, None
     weights = weights or [1.0] * len(dirs)
-    x = math.fsum(w * math.sin(math.radians(d)) for d, w in zip(dirs, weights)) / len(dirs)
-    y = math.fsum(w * math.cos(math.radians(d)) for d, w in zip(dirs, weights)) / len(dirs)
+    x = math.fsum(w * math.sin(math.radians(d)) for d, w in zip(dirs, weights, strict=True)) / len(dirs)
+    y = math.fsum(w * math.cos(math.radians(d)) for d, w in zip(dirs, weights, strict=True)) / len(dirs)
     mag = math.hypot(x, y)
     return (round(math.degrees(math.atan2(x, y)), 3) % 360 if mag > 1e-12 else None), mag
 
@@ -204,20 +241,22 @@ class Store:
     """SQLite database of parsed records. Ingest is idempotent, so replaying
     raw lines (rebuild) never duplicates rows."""
 
-    def __init__(self, path):
+    def __init__(self, path: str | os.PathLike[str]) -> None:
         self.db = sqlite3.connect(str(path), isolation_level=None, timeout=60)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
-        self.cols = {}
+        self.cols: dict[str, set[str]] = {}
         with self.transaction():
             self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS polls (recv_time REAL NOT NULL UNIQUE, ts INTEGER,"
-                " did TEXT, ok INTEGER NOT NULL, status INTEGER, latency REAL, error TEXT)")
+                " did TEXT, ok INTEGER NOT NULL, status INTEGER, latency REAL, error TEXT)"
+            )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS rt_requests (recv_time REAL NOT NULL UNIQUE,"
                 " ok INTEGER NOT NULL, status INTEGER, latency REAL, duration INTEGER,"
-                " broadcast_port INTEGER, error TEXT)")
+                " broadcast_port INTEGER, error TEXT)"
+            )
             for table, fields in FIELDS.items():
                 self._ensure(table, fields)
                 self.db.execute(f"DROP VIEW IF EXISTS {q(table + '_si')}")
@@ -226,26 +265,28 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('harvester_version', ?)", (VERSION,))
 
     @contextlib.contextmanager
-    def transaction(self):
+    def transaction(self) -> Iterator[None]:
         self.db.execute("BEGIN")
         try:
             yield
         except BaseException:
             self.db.execute("ROLLBACK")
-            self.cols.clear()   # an ALTER TABLE may have been rolled back
+            self.cols.clear()  # an ALTER TABLE may have been rolled back
             raise
         self.db.execute("COMMIT")
 
-    def close(self):
+    def close(self) -> None:
         self.db.close()
 
-    def _ensure(self, table, fields):
+    def _ensure(self, table: str, fields: Iterable[str]) -> None:
         have = self.cols.get(table)
         if have is None:
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({q(table)})")}
             if not have:
-                self.db.execute(f"CREATE TABLE {q(table)} (recv_time REAL NOT NULL, ts INTEGER,"
-                                " did TEXT, lsid INTEGER, UNIQUE (ts, lsid, did))")
+                self.db.execute(
+                    f"CREATE TABLE {q(table)} (recv_time REAL NOT NULL, ts INTEGER,"
+                    " did TEXT, lsid INTEGER, UNIQUE (ts, lsid, did))"
+                )
                 have = set(BASE_COLS)
                 if table not in FIELDS:
                     log.warning("new record type: created table %s", table)
@@ -258,35 +299,39 @@ class Store:
                 if f not in FIELDS.get(table, ()):
                     log.warning("new field: added column %s.%s", table, f)
 
-    def _insert(self, table, recv, ts, did, rec):
-        row = {"recv_time": recv, "ts": ts, "did": did}
+    def _insert(self, table: str, recv: float, ts: Any, did: Any, rec: Json) -> None:
+        row: Json = {"recv_time": recv, "ts": ts, "did": did}
         for k, v in rec.items():
-            if k == "data_structure_type":   # implied by the table
+            if k == "data_structure_type":  # implied by the table
                 continue
             if isinstance(v, (dict, list)):
-                v = json.dumps(v, separators=(",", ":"))
-            elif isinstance(v, int) and not -2**63 <= v < 2**63:
-                v = str(v)
-            row[column_name(k)] = v
+                row[column_name(k)] = json.dumps(v, separators=(",", ":"))
+            elif isinstance(v, int) and not -(2**63) <= v < 2**63:
+                row[column_name(k)] = str(v)
+            else:
+                row[column_name(k)] = v
         self._ensure(table, [c for c in row if c not in BASE_COLS])
-        self.db.execute(f"INSERT OR IGNORE INTO {q(table)} ({', '.join(map(q, row))})"
-                        f" VALUES ({', '.join('?' * len(row))})", list(row.values()))
+        self.db.execute(
+            f"INSERT OR IGNORE INTO {q(table)} ({', '.join(map(q, row))}) VALUES ({', '.join('?' * len(row))})",
+            list(row.values()),
+        )
 
-    def _conditions(self, stream, recv, data):
+    def _conditions(self, stream: str, recv: float, data: Json) -> None:
         ts, did = data.get("ts"), data.get("did")
         for c in data.get("conditions") or []:
             if isinstance(c, dict):
                 dst = c.get("data_structure_type")
-                table = TABLE_FOR.get((stream, dst)) or \
-                    f"{stream}_type" + re.sub(r"\W", "_", str(dst), flags=re.ASCII)
+                table = TABLE_FOR.get((stream, dst)) or f"{stream}_type" + re.sub(r"\W", "_", str(dst), flags=re.ASCII)
                 self._insert(table, recv, ts, did, c)
 
-    def ingest(self, rec):
+    def ingest(self, rec: Json) -> tuple[str | None, Json | None]:
         """Parse one raw-archive line (decoded) into the tables.
 
         Returns (error or None, payload) where payload is the WLL's `data`
         object for HTTP lines and the packet itself for UDP lines."""
         kind, recv, body = rec.get("kind"), rec.get("recv"), rec.get("body")
+        if not isinstance(recv, (int, float)):
+            return "raw line has no recv time", None
         if kind == "udp":
             if not isinstance(body, dict):
                 return "unparseable UDP packet", None
@@ -306,29 +351,31 @@ class Store:
                 data = body["data"]
         d = data or {}
         if kind == "cc":
-            self.db.execute("INSERT OR IGNORE INTO polls VALUES (?,?,?,?,?,?,?)",
-                            (recv, d.get("ts"), d.get("did"), int(err is None), status,
-                             rec.get("latency"), err))
+            self.db.execute(
+                "INSERT OR IGNORE INTO polls VALUES (?,?,?,?,?,?,?)",
+                (recv, d.get("ts"), d.get("did"), int(err is None), status, rec.get("latency"), err),
+            )
             if data:
                 self._conditions("http", recv, data)
         elif kind == "rt":
-            self.db.execute("INSERT OR IGNORE INTO rt_requests VALUES (?,?,?,?,?,?,?)",
-                            (recv, int(err is None), status, rec.get("latency"),
-                             d.get("duration"), d.get("broadcast_port"), err))
+            self.db.execute(
+                "INSERT OR IGNORE INTO rt_requests VALUES (?,?,?,?,?,?,?)",
+                (recv, int(err is None), status, rec.get("latency"), d.get("duration"), d.get("broadcast_port"), err),
+            )
         else:
             err = f"unknown raw record kind {kind!r}"
         return err, data
 
     # -- period summaries ---------------------------------------------------
 
-    def last_summary(self, period):
+    def last_summary(self, period: int) -> int | None:
         """Start of the newest summary row for this period, or None."""
         table = summary_table(period)
         if not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone():
             return None
         return self.db.execute(f"SELECT max(t_start) FROM {q(table)}").fetchone()[0]
 
-    def summarize(self, period, t0, t1):
+    def summarize(self, period: int, t0: float, t1: float) -> int:
         """(Re)compute the summary row of every period starting in [t0, t1)
         from the stored 10 s records, a day per transaction; returns the
         number of rows written. A period still in progress gets a partial
@@ -345,7 +392,7 @@ class Store:
             start = end
         return n
 
-    def _ensure_summary(self, table):
+    def _ensure_summary(self, table: str) -> None:
         if table in self.cols:
             return
         self.db.execute(f"CREATE TABLE IF NOT EXISTS {q(table)} (t_start INTEGER PRIMARY KEY)")
@@ -355,27 +402,33 @@ class Store:
                 self.db.execute(f"ALTER TABLE {q(table)} ADD COLUMN {q(c)}")
         self.cols[table] = have | set(SUMMARY_COLS)
 
-    def _summarize_chunk(self, table, period, start, end):
-        bins = collections.defaultdict(lambda: collections.defaultdict(list))
-        key = lambda t: int(t // period) * period   # noqa: E731
-        views = collections.defaultdict(list)
+    def _summarize_chunk(self, table: str, period: int, start: int, end: int) -> int:
+        bins: collections.defaultdict[int, collections.defaultdict[str, list[Any]]] = collections.defaultdict(
+            lambda: collections.defaultdict(list)
+        )
+
+        def key(t: float) -> int:
+            return int(t // period) * period
+
+        views: collections.defaultdict[str, list[tuple[str, str]]] = collections.defaultdict(list)
         for prefix, (view, col) in SUMMARY_STATS.items():
             views[view].append((prefix, col))
         for view, pcs in views.items():
             cols = list(dict.fromkeys([c for _, c in pcs] + (ISS_EXTRA if view == "iss_si" else [])))
-            lead = RAIN_GAP if view == "iss_si" else 0.0   # previous sample, for rain increments
-            prev_rain = None
-            for r in self.db.execute(f"SELECT recv_time, {', '.join(map(q, cols))} FROM {q(view)}"
-                                     " WHERE recv_time >= ? AND recv_time < ? ORDER BY recv_time",
-                                     (start - lead, end)):
-                t, vals = r[0], dict(zip(cols, r[1:]))
+            lead = RAIN_GAP if view == "iss_si" else 0.0  # previous sample, for rain increments
+            prev_rain: tuple[float, float] | None = None
+            for r in self.db.execute(
+                f"SELECT recv_time, {', '.join(map(q, cols))} FROM {q(view)}"
+                " WHERE recv_time >= ? AND recv_time < ? ORDER BY recv_time",
+                (start - lead, end),
+            ):
+                t, vals = r[0], dict(zip(cols, r[1:], strict=True))
                 if view == "iss_si":
                     rain = vals["rainfall_daily_mm"]
                     if rain is not None:
                         if t >= start and prev_rain and t - prev_rain[0] <= RAIN_GAP:
                             # rainfall_daily resets at the WLL's local midnight
-                            bins[key(t)]["rain_mm"].append(
-                                rain - prev_rain[1] if rain >= prev_rain[1] else rain)
+                            bins[key(t)]["rain_mm"].append(rain - prev_rain[1] if rain >= prev_rain[1] else rain)
                         prev_rain = (t, rain)
                 if t < start:
                     continue
@@ -385,13 +438,18 @@ class Store:
                         b[prefix].append(vals[col])
                 if view == "iss_si":
                     b["iss"].append(vals)
-        for t, ok in self.db.execute("SELECT recv_time, ok FROM polls WHERE recv_time >= ? AND recv_time < ?",
-                                     (start, end)):
+        for t, ok in self.db.execute(
+            "SELECT recv_time, ok FROM polls WHERE recv_time >= ? AND recv_time < ?", (start, end)
+        ):
             bins[key(t)]["ok" if ok else "failed"].append(t)
 
         for b0, v in bins.items():
-            row = {"t_start": b0, "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(b0)),
-                   "n_polls": len(v["ok"]), "n_failed": len(v["failed"])}
+            row: Json = {
+                "t_start": b0,
+                "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(b0)),
+                "n_polls": len(v["ok"]),
+                "n_failed": len(v["failed"]),
+            }
             iss = v["iss"]
             rx = [s["rx_state"] for s in iss if s["rx_state"] is not None]
             row["rx_ok_frac"] = sum(x == 0 for x in rx) / len(rx) if rx else None
@@ -401,23 +459,27 @@ class Store:
             for prefix in SUMMARY_STATS:
                 xs = v[prefix]
                 stats = (min(xs), statistics.fmean(xs), statistics.median(xs), max(xs)) if xs else (None,) * 4
-                row.update(zip((f"{prefix}_{s}" for s in STAT_NAMES), stats))
-            wind = [(s["wind_speed_last_ms"], s["wind_dir_last"]) for s in iss
-                    if s["wind_speed_last_ms"] is not None and s["wind_dir_last"] is not None]
+                row.update(zip((f"{prefix}_{s}" for s in STAT_NAMES), stats, strict=True))
+            wind = [
+                (s["wind_speed_last_ms"], s["wind_dir_last"])
+                for s in iss
+                if s["wind_speed_last_ms"] is not None and s["wind_dir_last"] is not None
+            ]
             moving = [d for sp, d in wind if sp > 0]
             row["n_calm"] = len(wind) - len(moving) if wind else None
             # Compass directions are averaged as unit vectors (calms excluded);
             # steadiness is the resultant length, 1 = constant direction.
             row["wind_dir_mean_deg"], row["wind_dir_steadiness"] = vector_mean(moving)
-            row["wind_vec_dir_deg"], row["wind_vec_ms"] = vector_mean([d for _, d in wind],
-                                                                      [sp for sp, _ in wind])
+            row["wind_vec_dir_deg"], row["wind_vec_ms"] = vector_mean([d for _, d in wind], [sp for sp, _ in wind])
             last = iss[-1] if iss else {}
             row["wll_wind_avg_10min_ms"] = last.get("wind_speed_avg_last_10_min_ms")
             row["wll_wind_dir_10min_deg"] = last.get("wind_dir_scalar_avg_last_10_min")
             row["wll_gust_10min_ms"] = last.get("wind_speed_hi_last_10_min_ms")
             row["wll_gust_dir_10min_deg"] = last.get("wind_dir_at_hi_speed_last_10_min")
-            self.db.execute(f"INSERT OR REPLACE INTO {q(table)} ({', '.join(map(q, row))})"
-                            f" VALUES ({', '.join('?' * len(row))})", list(row.values()))
+            self.db.execute(
+                f"INSERT OR REPLACE INTO {q(table)} ({', '.join(map(q, row))}) VALUES ({', '.join('?' * len(row))})",
+                list(row.values()),
+            )
         return len(bins)
 
 
@@ -425,7 +487,8 @@ class Store:
 # Raw archive
 # ---------------------------------------------------------------------------
 
-def raw_line(meta, text):
+
+def raw_line(meta: Json, text: str | None) -> str:
     """One archive line: `meta` as JSON with the device's reply spliced in
     verbatim as "body" (or kept as a "text" string if it is not JSON)."""
     if text is None:
@@ -440,7 +503,7 @@ def raw_line(meta, text):
     return json.dumps(meta, separators=(",", ":"))[:-1] + ',"body":' + body + "}"
 
 
-def gzip_file(path):
+def gzip_file(path: Path) -> None:
     """Compress a finished day file to <name>.gz, appending a new gzip member
     if the .gz already exists (clock stepped back across midnight)."""
     gz = path.with_name(path.name + ".gz")
@@ -460,34 +523,37 @@ def gzip_file(path):
 class RawArchive:
     """Append-only daily (UTC) JSON-lines files for one stream."""
 
-    def __init__(self, root, stream):
+    def __init__(self, root: str | Path, stream: str) -> None:
         self.root, self.stream = Path(root), stream
-        self.day = self.fh = None
+        self.day: str | None = None
+        self.fh: TextIO | None = None
 
-    def write(self, recv, line):
+    def write(self, recv: float, line: str) -> None:
         day = time.strftime("%Y%m%d", time.gmtime(recv))
-        if day != self.day:
+        if day != self.day or self.fh is None:
             self.close()
             path = self.root / day[:4] / f"wll_{self.stream}_{day}.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
-            self.fh, self.day = open(path, "a", encoding="utf-8"), day
+            # Kept open across writes; closed at the day rollover or close().
+            self.fh, self.day = open(path, "a", encoding="utf-8"), day  # noqa: SIM115
             self.compress_finished(day)
+        assert self.fh is not None
         self.fh.write(line + "\n")
         self.fh.flush()
 
-    def compress_finished(self, today):
+    def compress_finished(self, today: str) -> None:
         for p in sorted(self.root.glob(f"*/wll_{self.stream}_*.jsonl")):
             if p.name != f"wll_{self.stream}_{today}.jsonl":
                 try:
                     gzip_file(p)
-                except OSError as e:   # retried at the next rollover
+                except OSError as e:  # retried at the next rollover
                     log.error("could not compress %s: %s", p, e)
 
-    def sync(self):
+    def sync(self) -> None:
         if self.fh:
             os.fsync(self.fh.fileno())
 
-    def close(self):
+    def close(self) -> None:
         if self.fh:
             self.fh.flush()
             os.fsync(self.fh.fileno())
@@ -495,12 +561,15 @@ class RawArchive:
         self.day = self.fh = None
 
 
-def read_raw(paths):
+def read_raw(paths: Iterable[Path]) -> Iterator[tuple[Path, int, Any]]:
     """Yield (path, line number, decoded record) from raw archive files,
     skipping (and logging) undecodable lines such as a crash-truncated tail."""
     for p in paths:
-        opener = gzip.open if p.suffix == ".gz" else open
-        with opener(p, "rt", encoding="utf-8", errors="replace") as fh:
+        with (
+            gzip.open(p, "rt", encoding="utf-8", errors="replace")
+            if p.suffix == ".gz"
+            else open(p, encoding="utf-8", errors="replace")
+        ) as fh:
             for n, line in enumerate(fh, 1):
                 if not line.strip():
                     continue
@@ -514,50 +583,57 @@ def read_raw(paths):
 # Harvester
 # ---------------------------------------------------------------------------
 
-def utc_iso(t):
-    return None if t is None else dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")
+
+def utc_iso(t: float | None) -> str | None:
+    return None if t is None else dt.datetime.fromtimestamp(t, dt.UTC).isoformat(timespec="seconds")
 
 
-def noteworthy(n):
+def noteworthy(n: int) -> bool:
     """Log the 1st, 3rd, 10th, 30th, ... and every 360th repeat of a failure."""
     return n in (1, 3, 10, 30, 100) or n % 360 == 0
 
 
 class Harvester:
-    def __init__(self, cfg):
+    def __init__(self, cfg: argparse.Namespace) -> None:
         self.cfg = cfg
         self.base = f"http://{cfg.host}" + ("" if cfg.port == 80 else f":{cfg.port}")
         data = Path(cfg.data_dir)
         data.mkdir(parents=True, exist_ok=True)
         self.store = Store(data / "wll.sqlite")
-        self.raw = {s: RawArchive(data / "raw", s) for s in ("http", "udp")} if cfg.raw else {}
+        self.raw: dict[str, RawArchive] = {s: RawArchive(data / "raw", s) for s in ("http", "udp")} if cfg.raw else {}
         self.status_path = data / "status.json"
         self.stopping = False
-        self.sock = None
-        self.did = None
+        self.sock: socket.socket | None = None
+        self.did: str | None = None
         self.started = time.time()
+        # First summary period not yet written; run() catches up from the database.
+        self.sum_from = math.floor(self.started / cfg.summary_period) * cfg.summary_period
         # HTTP polling
         self.http_ok = self.http_fail = self.http_consec = 0
-        self.http_last_ok = self.http_fail_since = None
-        self.http_last_error = self.http_last_error_time = None
-        self.offsets = []          # recv_time - device ts, this hour
-        self.last_offset = None
+        self.http_last_ok: float | None = None
+        self.http_fail_since: float | None = None
+        self.http_last_error: str | None = None
+        self.http_last_error_time: float | None = None
+        self.offsets: list[float] = []  # recv_time - device ts, this hour
+        self.last_offset: float | None = None
         self.clock_warned = 0.0
         # UDP real-time
-        self.udp_note = "disabled" if not cfg.udp else None
+        self.udp_note: str | None = "disabled" if not cfg.udp else None
         self.udp_packets = self.udp_bad = self.udp_dups = 0
-        self.udp_last = self.udp_last_mono = None
-        self.udp_prev, self.udp_prev_time = None, 0.0
+        self.udp_last: float | None = None
+        self.udp_last_mono: float | None = None
+        self.udp_prev: bytes | None = None
+        self.udp_prev_time = 0.0
         self.rt_ok = self.rt_fail = self.rt_consec = 0
-        self.rt_ok_mono = None
+        self.rt_ok_mono: float | None = None
         self.rt_next = 0.0
-        self.rt_last_error = None
+        self.rt_last_error: str | None = None
         self.stall_wait, self.stalls = UDP_STALL, 0
         self.hour = self.hour_polls = self.hour_ok = self.hour_udp = 0
 
     # -- plumbing -----------------------------------------------------------
 
-    def record(self, stream, meta, text):
+    def record(self, stream: str, meta: Json, text: str | None) -> tuple[str | None, Json | None]:
         """Archive one response/packet/failure and ingest it into the DB."""
         line = raw_line(meta, text)
         if stream in self.raw:
@@ -572,20 +648,20 @@ class Harvester:
             log.error("database write failed (data kept in raw archive): %s", e)
             return f"database: {e}", None
 
-    def http_get(self, path):
+    def http_get(self, path: str) -> tuple[float, float, int | None, str | None, str | None]:
         m0 = time.monotonic()
         t0 = time.time()
-        status = body = err = None
+        status: int | None = None
+        body: bytes | None = None
+        err: str | None = None
         req = urllib.request.Request(self.base + path, headers={"User-Agent": f"wllharvest/{VERSION}"})
         try:
             with urllib.request.urlopen(req, timeout=self.cfg.timeout) as r:
                 status, body = r.status, r.read()
-        except urllib.error.HTTPError as e:   # the WLL explains errors in a JSON body
+        except urllib.error.HTTPError as e:  # the WLL explains errors in a JSON body
             status = e.code
-            try:
+            with contextlib.suppress(OSError, http.client.HTTPException):
                 body = e.read()
-            except (OSError, http.client.HTTPException):
-                pass
         except (OSError, http.client.HTTPException, ValueError) as e:
             err = f"{type(e).__name__}: {e}"
         latency = time.monotonic() - m0
@@ -593,8 +669,10 @@ class Harvester:
         return t0 + latency, latency, status, text, err
 
     @staticmethod
-    def meta(recv, kind, status=None, latency=None, error=None):
-        m = {"recv": round(recv, 3), "kind": kind}
+    def meta(
+        recv: float, kind: str, status: int | None = None, latency: float | None = None, error: str | None = None
+    ) -> Json:
+        m: Json = {"recv": round(recv, 3), "kind": kind}
         if status is not None:
             m["status"] = status
         if latency is not None:
@@ -605,11 +683,12 @@ class Harvester:
 
     # -- HTTP current conditions --------------------------------------------
 
-    def poll(self):
+    def poll(self) -> None:
         recv, latency, status, text, err = self.http_get("/v1/current_conditions")
         err, data = self.record("http", self.meta(recv, "cc", status, latency, err), text)
         self.hour_polls += 1
-        if err:
+        if err or data is None:
+            err = err or "no data"
             self.http_fail += 1
             self.http_consec += 1
             self.http_fail_since = self.http_fail_since or recv
@@ -618,8 +697,11 @@ class Harvester:
                 log.warning("current_conditions failed (%d in a row): %s", self.http_consec, err)
             return
         if self.http_consec:
-            log.info("current_conditions recovered after %d failures (%.0f s)",
-                     self.http_consec, recv - self.http_fail_since)
+            log.info(
+                "current_conditions recovered after %d failures (%.0f s)",
+                self.http_consec,
+                recv - (self.http_fail_since or recv),
+            )
         self.http_ok += 1
         self.hour_ok += 1
         self.http_consec, self.http_fail_since, self.http_last_ok = 0, None, recv
@@ -641,11 +723,11 @@ class Harvester:
 
     # -- UDP real-time ------------------------------------------------------
 
-    def open_udp(self):
+    def open_udp(self) -> None:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, "SO_REUSEPORT"):   # share the port with other WLL clients
+            if hasattr(socket, "SO_REUSEPORT"):  # share the port with other WLL clients
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             s.bind(("", self.cfg.udp_port))
             s.setblocking(False)
@@ -655,16 +737,17 @@ class Harvester:
             self.udp_note = f"UDP disabled: cannot bind port {self.cfg.udp_port}: {e}"
             log.error(self.udp_note)
 
-    def request_rt(self):
+    def request_rt(self) -> None:
         dur = self.cfg.rt_duration
         recv, latency, status, text, err = self.http_get(f"/v1/real_time?duration={dur}")
         err, data = self.record("http", self.meta(recv, "rt", status, latency, err), text)
         mono = time.monotonic()
-        if err:
+        if err or data is None:
+            err = err or "no data"
             self.rt_fail += 1
             self.rt_consec += 1
             self.rt_last_error = err
-            if status == 409:   # documented: no ISS configured on this WLL
+            if status == 409:  # documented: no ISS configured on this WLL
                 self.rt_next = mono + 3600
                 log.warning("real-time broadcast unavailable (no ISS configured?): %s", err)
             else:
@@ -680,10 +763,13 @@ class Harvester:
             log.warning("WLL broadcasts on port %s but we listen on %d", port, self.cfg.udp_port)
         log.debug("real-time broadcast requested for %d s (WLL says %s)", dur, data.get("duration"))
 
-    def read_udp(self):
+    def read_udp(self) -> None:
+        sock = self.sock
+        if sock is None:
+            return
         while True:
             try:
-                pkt, (ip, _port) = self.sock.recvfrom(65535)
+                pkt, (ip, _port) = sock.recvfrom(65535)
             except BlockingIOError:
                 return
             except OSError as e:
@@ -714,7 +800,7 @@ class Harvester:
             self.udp_last, self.udp_last_mono = recv, time.monotonic()
             self.stall_wait, self.stalls = UDP_STALL, 0
 
-    def check_udp_stall(self, mono):
+    def check_udp_stall(self, mono: float) -> None:
         """Re-request broadcasts if the WLL went quiet (e.g. it rebooted)."""
         if not self.sock or self.rt_ok_mono is None or self.rt_consec:
             return
@@ -725,42 +811,59 @@ class Harvester:
         level = logging.WARNING if self.stalls <= 3 or self.stalls % 6 == 0 else logging.DEBUG
         log.log(level, "no real-time UDP for %.0f s; re-requesting broadcast", silent)
         if self.stalls == 3 and self.udp_packets == 0:
-            log.warning("the WLL accepts real-time requests but no UDP has ever arrived: the "
-                        "harvester must be on the WLL's subnet (broadcasts are not routed), use "
-                        "host networking in Docker, and port %d must not be firewalled. "
-                        "Set WLL_UDP=0 to poll over HTTP only.", self.cfg.udp_port)
+            log.warning(
+                "the WLL accepts real-time requests but no UDP has ever arrived: the "
+                "harvester must be on the WLL's subnet (broadcasts are not routed), use "
+                "host networking in Docker, and port %d must not be firewalled. "
+                "Set WLL_UDP=0 to poll over HTTP only.",
+                self.cfg.udp_port,
+            )
         self.stall_wait = min(self.stall_wait * 2, UDP_STALL_MAX)
         self.rt_next = mono
 
     # -- status -------------------------------------------------------------
 
-    def status(self):
+    def status(self) -> Json:
         return {
-            "version": VERSION, "pid": os.getpid(), "wll": self.base, "did": self.did,
-            "started": utc_iso(self.started), "updated": utc_iso(time.time()),
+            "version": VERSION,
+            "pid": os.getpid(),
+            "wll": self.base,
+            "did": self.did,
+            "started": utc_iso(self.started),
+            "updated": utc_iso(time.time()),
             "updated_epoch": round(time.time(), 3),
-            "http": {"ok": self.http_ok, "fail": self.http_fail,
-                     "consecutive_fail": self.http_consec,
-                     "last_ok": utc_iso(self.http_last_ok), "last_ok_epoch": self.http_last_ok,
-                     "last_error": self.http_last_error,
-                     "last_error_time": utc_iso(self.http_last_error_time),
-                     "clock_offset_s": None if self.last_offset is None else round(self.last_offset, 3)},
-            "udp": {"enabled": self.sock is not None, "note": self.udp_note,
-                    "packets": self.udp_packets, "bad_packets": self.udp_bad,
-                    "duplicates_dropped": self.udp_dups,
-                    "last_packet": utc_iso(self.udp_last), "last_packet_epoch": self.udp_last,
-                    "rt_requests_ok": self.rt_ok, "rt_requests_fail": self.rt_fail,
-                    "last_error": self.rt_last_error},
+            "http": {
+                "ok": self.http_ok,
+                "fail": self.http_fail,
+                "consecutive_fail": self.http_consec,
+                "last_ok": utc_iso(self.http_last_ok),
+                "last_ok_epoch": self.http_last_ok,
+                "last_error": self.http_last_error,
+                "last_error_time": utc_iso(self.http_last_error_time),
+                "clock_offset_s": None if self.last_offset is None else round(self.last_offset, 3),
+            },
+            "udp": {
+                "enabled": self.sock is not None,
+                "note": self.udp_note,
+                "packets": self.udp_packets,
+                "bad_packets": self.udp_bad,
+                "duplicates_dropped": self.udp_dups,
+                "last_packet": utc_iso(self.udp_last),
+                "last_packet_epoch": self.udp_last,
+                "rt_requests_ok": self.rt_ok,
+                "rt_requests_fail": self.rt_fail,
+                "last_error": self.rt_last_error,
+            },
         }
 
-    def summarize(self, t0, t1, why):
+    def summarize(self, t0: float, t1: float, why: str) -> None:
         try:
             n = self.store.summarize(self.cfg.summary_period, t0, t1)
             log.debug("%s: wrote %d summary rows", why, n)
         except sqlite3.Error as e:
             log.error("%s summary failed (redo with `summarize`): %s", why, e)
 
-    def write_status(self):
+    def write_status(self) -> None:
         tmp = self.status_path.with_name(self.status_path.name + ".tmp")
         try:
             tmp.write_text(json.dumps(self.status(), indent=1) + "\n")
@@ -768,7 +871,7 @@ class Harvester:
         except OSError as e:
             log.error("cannot write %s: %s", self.status_path, e)
 
-    def housekeeping(self):
+    def housekeeping(self) -> None:
         for r in self.raw.values():
             try:
                 r.sync()
@@ -779,8 +882,11 @@ class Harvester:
         if hour != self.hour:
             if self.hour and self.hour_polls:
                 o = self.offsets
-                clock = (f"; host-WLL clock offset median {statistics.median(o):+.2f} s "
-                         f"[{min(o):+.2f}, {max(o):+.2f}]") if o else ""
+                clock = (
+                    (f"; host-WLL clock offset median {statistics.median(o):+.2f} s [{min(o):+.2f}, {max(o):+.2f}]")
+                    if o
+                    else ""
+                )
                 udp = f"; {self.hour_udp} UDP packets" if self.sock else ""
                 log.info("hourly: %d/%d polls ok%s%s", self.hour_ok, self.hour_polls, udp, clock)
             self.hour = hour
@@ -789,15 +895,21 @@ class Harvester:
 
     # -- main loop ----------------------------------------------------------
 
-    def _stop(self, signum, _frame):
+    def _stop(self, signum: int, _frame: FrameType | None) -> None:
         log.info("received %s, shutting down", signal.Signals(signum).name)
         self.stopping = True
 
-    def run(self):
+    def run(self) -> None:
         cfg = self.cfg
-        log.info("wllharvest %s: polling %s every %g s, UDP %s, raw archive %s, data in %s",
-                 VERSION, self.base, cfg.interval, "on" if cfg.udp else "off",
-                 "on" if cfg.raw else "off", cfg.data_dir)
+        log.info(
+            "wllharvest %s: polling %s every %g s, UDP %s, raw archive %s, data in %s",
+            VERSION,
+            self.base,
+            cfg.interval,
+            "on" if cfg.udp else "off",
+            "on" if cfg.raw else "off",
+            cfg.data_dir,
+        )
         wake_r, wake_w = socket.socketpair()
         for s in (wake_r, wake_w):
             s.setblocking(False)
@@ -812,16 +924,16 @@ class Harvester:
         first = self.store.last_summary(period)
         if first is None:
             first = self.store.db.execute("SELECT min(recv_time) FROM polls").fetchone()[0]
-        self.sum_from = math.floor(now / period) * period   # first period not yet summarized
+        self.sum_from = math.floor(now / period) * period  # first period not yet summarized
         if first is not None:
             self.summarize(max(first, now - 2 * 86400), self.sum_from, "catch-up")
         log.info("summaries every %d s in table %s", period, summary_table(period))
-        next_poll = math.ceil(time.time() / interval) * interval   # aligned to UTC multiples
+        next_poll = math.ceil(time.time() / interval) * interval  # aligned to UTC multiples
         next_house = time.monotonic()
         try:
             while not self.stopping:
                 now, mono = time.time(), time.monotonic()
-                if next_poll - now > interval:   # wall clock stepped back
+                if next_poll - now > interval:  # wall clock stepped back
                     next_poll = math.ceil(now / interval) * interval
                 if now >= next_poll:
                     self.poll()
@@ -839,11 +951,10 @@ class Harvester:
                     end = math.floor((time.time() - 1.0) / period) * period
                     self.summarize(self.sum_from, end, "period")
                     self.sum_from = end
-                wait = min(next_poll - time.time(), next_house - mono, 1.0,
-                           self.sum_from + period + 1.0 - time.time())
+                wait = min(next_poll - time.time(), next_house - mono, 1.0, self.sum_from + period + 1.0 - time.time())
                 if self.sock:
                     wait = min(wait, self.rt_next - mono)
-                fds = [wake_r] + ([self.sock] if self.sock else [])
+                fds: list[socket.socket] = [wake_r] + ([self.sock] if self.sock else [])
                 ready = select.select(fds, [], [], max(0.0, wait))[0]
                 if self.sock in ready:
                     self.read_udp()
@@ -859,20 +970,24 @@ class Harvester:
             if self.sock:
                 self.sock.close()
             signal.set_wakeup_fd(-1)
-            log.info("stopped (%d polls ok, %d failed, %d UDP packets)",
-                     self.http_ok, self.http_fail, self.udp_packets)
+            log.info("stopped (%d polls ok, %d failed, %d UDP packets)", self.http_ok, self.http_fail, self.udp_packets)
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_run(args):
+
+def cmd_run(args: argparse.Namespace) -> None:
     if not args.host:
         sys.exit("set WLL_HOST (or --host) to the WeatherLink Live's IP address or hostname")
     if args.interval < MIN_POLL_INTERVAL and not args.allow_fast_poll:
-        log.warning("poll interval %g s is below the documented %g s minimum; using %g s",
-                    args.interval, MIN_POLL_INTERVAL, MIN_POLL_INTERVAL)
+        log.warning(
+            "poll interval %g s is below the documented %g s minimum; using %g s",
+            args.interval,
+            MIN_POLL_INTERVAL,
+            MIN_POLL_INTERVAL,
+        )
         args.interval = MIN_POLL_INTERVAL
     if not 1 <= args.rt_duration <= MAX_RT_DURATION:
         sys.exit(f"--rt-duration must be 1..{MAX_RT_DURATION} s")
@@ -881,7 +996,7 @@ def cmd_run(args):
     Harvester(args).run()
 
 
-def cmd_rebuild(args):
+def cmd_rebuild(args: argparse.Namespace) -> None:
     """Regenerate (or top up) a database from the raw archive."""
     raw = Path(args.raw_dir)
     paths = sorted(p for p in raw.glob("*/wll_*_*.jsonl*") if not p.name.endswith(".tmp"))
@@ -903,11 +1018,10 @@ def cmd_rebuild(args):
     log.info("rebuild done: %d lines from %d files (%d were failures/bad packets)", n, len(paths), bad)
 
 
-def cmd_summarize(args):
+def cmd_summarize(args: argparse.Namespace) -> None:
     """(Re)compute period summaries over a time range from the 10 s records."""
     store = Store(args.db)
-    t0 = parse_utc(args.start) if args.start else \
-        store.db.execute("SELECT min(recv_time) FROM polls").fetchone()[0]
+    t0 = parse_utc(args.start) if args.start else store.db.execute("SELECT min(recv_time) FROM polls").fetchone()[0]
     t1 = parse_utc(args.end) if args.end else time.time() + 1
     if t0 is None:
         sys.exit("no data to summarize")
@@ -915,37 +1029,41 @@ def cmd_summarize(args):
     store.close()
 
 
-def parse_utc(s):
+def parse_utc(s: str) -> float:
     t = dt.datetime.fromisoformat(s)
-    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+    return (t if t.tzinfo else t.replace(tzinfo=dt.UTC)).timestamp()
 
 
-def parse_range(start, end):
+def parse_range(start: str | None, end: str | None) -> tuple[float | None, float | None]:
     """(t0, t1) epoch s from ISO 8601 strings (UTC unless an offset is given;
     either may be None). A date-only end includes that whole day, so
     2026-10-01..2026-10-01 is one day; an end with a time is exclusive."""
     t0 = parse_utc(start) if start else None
-    t1 = None
+    t1: float | None = None
     if end:
         t1 = parse_utc(end) + (86400 if len(end.strip()) == 10 else 0)
     return t0, t1
 
 
-def time_column(cols):
+def time_column(cols: Sequence[str]) -> str | None:
     """Column a table/view is selected and ordered on: host arrival time for
     records and polls, period start for summaries."""
     return next((c for c in ("recv_time", "t_start") if c in cols), None)
 
 
-def select_range(db, table, t0=None, t1=None):
+def select_range(
+    db: sqlite3.Connection, table: str, t0: float | None = None, t1: float | None = None
+) -> sqlite3.Cursor:
     """Cursor over table rows with t0 <= time < t1 (epoch s; None = open)."""
     cols = [r[1] for r in db.execute(f"PRAGMA table_info({q(table)})")]
     if not cols:
-        names = [r[0] for r in db.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")]
+        names = [
+            r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
+        ]
         raise ValueError(f"no table/view {table!r}; have: {', '.join(names)}")
     tcol = time_column(cols)
-    where, params = [], []
+    where: list[str] = []
+    params: list[float] = []
     for bound, op in ((t0, ">="), (t1, "<")):
         if bound is not None:
             if not tcol:
@@ -960,22 +1078,21 @@ def select_range(db, table, t0=None, t1=None):
     return db.execute(sql, params)
 
 
-def cmd_export(args):
+def cmd_export(args: argparse.Namespace) -> None:
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     try:
         cur = select_range(db, args.table, *parse_range(args.start, args.end))
     except ValueError as e:
         sys.exit(str(e))
-    out = open(args.output, "w", newline="") if args.output else sys.stdout
-    w = csv.writer(out)
-    w.writerow([d[0] for d in cur.description])
-    w.writerows(cur)
-    if args.output:
-        out.close()
+    with contextlib.ExitStack() as stack:
+        out = stack.enter_context(open(args.output, "w", newline="")) if args.output else sys.stdout
+        w = csv.writer(out)
+        w.writerow([d[0] for d in cur.description])
+        w.writerows(cur)
     db.close()
 
 
-def cmd_status(args):
+def cmd_status(args: argparse.Namespace) -> None:
     data = Path(args.data_dir)
     st = data / "status.json"
     print(st.read_text() if st.exists() else f"(no {st})")
@@ -990,37 +1107,41 @@ def cmd_status(args):
     # ISS radio link quality as the WLL reports it on each poll:
     # rx_state 0 = synced, 1 = synced but missed 1-14 packets, 2 = scanning (lost).
     since = time.time() - args.hours * 3600
-    t0, t1, n = db.execute("SELECT min(recv_time), max(recv_time), count(*) FROM polls"
-                           " WHERE recv_time >= ?", (since,)).fetchone()
+    t0, t1, n = db.execute(
+        "SELECT min(recv_time), max(recv_time), count(*) FROM polls WHERE recv_time >= ?", (since,)
+    ).fetchone()
     ok = db.execute("SELECT count(*) FROM polls WHERE ok AND recv_time >= ?", (since,)).fetchone()[0]
     print(f"\nlast {args.hours:g} h ({utc_iso(t0)} .. {utc_iso(t1)}): {ok}/{n} polls answered")
     for txid, total, s0, s1, s2 in db.execute(
-            "SELECT txid, count(*), sum(rx_state = 0), sum(rx_state = 1), sum(rx_state = 2)"
-            " FROM iss WHERE recv_time >= ? GROUP BY txid ORDER BY txid", (since,)):
-        print(f"ISS txid {txid}: rx_state over {total} polls: synced {100 * s0 / total:.1f}%,"
-              f" missed packets {100 * s1 / total:.1f}%, lost/scanning {100 * s2 / total:.1f}%")
+        "SELECT txid, count(*), sum(rx_state = 0), sum(rx_state = 1), sum(rx_state = 2)"
+        " FROM iss WHERE recv_time >= ? GROUP BY txid ORDER BY txid",
+        (since,),
+    ):
+        print(
+            f"ISS txid {txid}: rx_state over {total} polls: synced {100 * s0 / total:.1f}%,"
+            f" missed packets {100 * s1 / total:.1f}%, lost/scanning {100 * s2 / total:.1f}%"
+        )
     db.close()
 
 
-def health_problems(data_dir, max_age=120.0, http_only=False):
+def health_problems(data_dir: str | Path, max_age: float = 120.0, http_only: bool = False) -> list[str]:
     """Reasons the harvester looks unhealthy, from its status.json; [] if fine."""
     try:
         st = json.loads((Path(data_dir) / "status.json").read_text())
     except (OSError, ValueError) as e:
         return [f"cannot read status: {e}"]
     now = time.time()
-    problems = []
+    problems: list[str] = []
     if now - (st.get("updated_epoch") or 0) > max_age:
         problems.append("status not updated (harvester stalled?)")
     if now - (st["http"].get("last_ok_epoch") or 0) > max_age:
         problems.append(f"no successful poll since {st['http'].get('last_ok')}: {st['http'].get('last_error')}")
-    if st["udp"].get("enabled") and not http_only \
-            and now - (st["udp"].get("last_packet_epoch") or 0) > max_age:
+    if st["udp"].get("enabled") and not http_only and now - (st["udp"].get("last_packet_epoch") or 0) > max_age:
         problems.append(f"no UDP packet since {st['udp'].get('last_packet')}")
     return problems
 
 
-def cmd_health(args):
+def cmd_health(args: argparse.Namespace) -> int:
     """Exit 0 if the harvester is alive and fresh data is arriving, else 1."""
     problems = health_problems(args.data_dir, args.max_age, args.http_only)
     print("UNHEALTHY: " + "; ".join(problems) if problems else "OK")
@@ -1032,9 +1153,11 @@ def cmd_health(args):
 # ---------------------------------------------------------------------------
 
 # Tables offered over HTTP: name -> (description, max days per request or None)
-SERVE_TABLES = {
-    summary_table(SUMMARY_PERIOD): (f"{SUMMARY_PERIOD // 60}-minute summaries: min/mean/median/max, "
-                                    "rain, wind direction (SI units)", None),
+SERVE_TABLES: dict[str, tuple[str, int | None]] = {
+    summary_table(SUMMARY_PERIOD): (
+        (f"{SUMMARY_PERIOD // 60}-minute summaries: min/mean/median/max, rain, wind direction (SI units)"),
+        None,
+    ),
     "iss_si": ("outdoor sensors every 10 s (SI units)", 31),
     "baro_si": ("barometer every 10 s (hPa)", 31),
     "inside_si": ("WLL indoor temperature and humidity every 10 s (SI units)", 31),
@@ -1046,10 +1169,14 @@ DOCS_URL = "https://github.com/mousebrains/WeatherLink#readme"
 class CSVHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"wllharvest/{VERSION}"
 
-    def log_message(self, fmt, *args):
-        log.info("%s %s", self.address_string(), fmt % args)
+    @property
+    def srv(self) -> "CSVServer":
+        return cast(CSVServer, self.server)
 
-    def send_text(self, code, text, ctype="text/plain; charset=utf-8"):
+    def log_message(self, format: str, *args: Any) -> None:
+        log.info("%s %s", self.address_string(), format % args)
+
+    def send_text(self, code: int, text: str, ctype: str = "text/plain; charset=utf-8") -> None:
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -1057,7 +1184,7 @@ class CSVHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         url = urllib.parse.urlparse(self.path)
         qs = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query).items()}
         if url.path == "/":
@@ -1065,18 +1192,18 @@ class CSVHandler(http.server.BaseHTTPRequestHandler):
         if url.path == "/csv":
             return self.csv(qs)
         if url.path == "/health":
-            problems = health_problems(self.server.data_dir)
-            return self.send_text(503 if problems else 200,
-                                  ("UNHEALTHY: " + "; ".join(problems) if problems else "OK") + "\n")
+            problems = health_problems(self.srv.data_dir)
+            return self.send_text(
+                503 if problems else 200, ("UNHEALTHY: " + "; ".join(problems) if problems else "OK") + "\n"
+            )
         if url.path == "/status.json":
             try:
-                return self.send_text(200, (self.server.data_dir / "status.json").read_text(),
-                                      "application/json")
+                return self.send_text(200, (self.srv.data_dir / "status.json").read_text(), "application/json")
             except OSError as e:
                 return self.send_text(503, f"no status: {e}\n")
         self.send_text(404, "not found; try / or /csv?table=...&start=YYYY-MM-DD&end=YYYY-MM-DD\n")
 
-    def csv(self, qs):
+    def csv(self, qs: dict[str, str]) -> None:
         table = qs.get("table", summary_table(SUMMARY_PERIOD))
         if table not in SERVE_TABLES:
             return self.send_text(400, f"table must be one of: {', '.join(SERVE_TABLES)}\n")
@@ -1090,16 +1217,21 @@ class CSVHandler(http.server.BaseHTTPRequestHandler):
         if t1 <= t0:
             return self.send_text(400, "end must be after start\n")
         if limit and t1 - t0 > limit * 86400:
-            return self.send_text(400, f"{table} is limited to {limit} days per request; "
-                                       f"use {summary_table(SUMMARY_PERIOD)} for longer spans\n")
-        db = sqlite3.connect(f"file:{self.server.db_path}?mode=ro", uri=True, timeout=30)
+            return self.send_text(
+                400,
+                f"{table} is limited to {limit} days per request; "
+                f"use {summary_table(SUMMARY_PERIOD)} for longer spans\n",
+            )
+        db = sqlite3.connect(f"file:{self.srv.db_path}?mode=ro", uri=True, timeout=30)
+
+        def stamp(t: float) -> str:
+            return time.strftime("%Y%m%dT%H%M", time.gmtime(t))
+
         try:
             cur = select_range(db, table, t0, t1)
-            stamp = lambda t: time.strftime("%Y%m%dT%H%M", time.gmtime(t))   # noqa: E731
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
-            self.send_header("Content-Disposition",
-                             f'attachment; filename="wll_{table}_{stamp(t0)}_{stamp(t1)}.csv"')
+            self.send_header("Content-Disposition", f'attachment; filename="wll_{table}_{stamp(t0)}_{stamp(t1)}.csv"')
             self.end_headers()
             buf = io.StringIO()
             w = csv.writer(buf)
@@ -1118,17 +1250,23 @@ class CSVHandler(http.server.BaseHTTPRequestHandler):
         finally:
             db.close()
 
-    def page(self):
-        problems = health_problems(self.server.data_dir)
+    def page(self) -> str:
+        problems = health_problems(self.srv.data_dir)
         try:
-            last = json.loads((self.server.data_dir / "status.json").read_text())["http"]["last_ok"]
+            last = json.loads((self.srv.data_dir / "status.json").read_text())["http"]["last_ok"]
         except (OSError, ValueError, KeyError):
             last = "unknown"
         today = time.strftime("%Y-%m-%d", time.gmtime())
         week = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 6 * 86400))
-        options = "".join(f'<option value="{t}">{t} &mdash; {d}{f" (max {n} days)" if n else ""}</option>'
-                          for t, (d, n) in SERVE_TABLES.items())
+        options = "".join(
+            f'<option value="{t}">{t} &mdash; {d}{f" (max {n} days)" if n else ""}</option>'
+            for t, (d, n) in SERVE_TABLES.items()
+        )
         state = "collecting" if not problems else "PROBLEM: " + "; ".join(problems)
+        example = (
+            f"http://{self.headers.get('Host', 'host')}/csv?table={summary_table(SUMMARY_PERIOD)}"
+            f"&amp;start={week}&amp;end={today}"
+        )
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Weather data</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:44rem;margin:2rem auto;padding:0 1rem}}
@@ -1142,16 +1280,25 @@ button{{margin-top:1rem}}code{{background:#eee;padding:0 .2rem}}small{{color:#55
 <label for="end">To (UTC date, inclusive)</label><input id="end" name="end" type="date" value="{today}">
 <br><button type="submit">Download CSV</button></form>
 <p><small>All times are UTC. Scripts can fetch the same file, e.g.
-<code>curl -OJ 'http://{self.headers.get("Host", "host")}/csv?table={summary_table(SUMMARY_PERIOD)}&amp;start={week}&amp;end={today}'</code>.
+<code>curl -OJ
+'{example}'</code>.
 Column definitions: <a href="{DOCS_URL}">README</a>.</small></p></body></html>"""
 
 
-def cmd_serve(args):
-    srv = http.server.ThreadingHTTPServer((args.bind, args.port), CSVHandler)
-    srv.daemon_threads = True
-    srv.data_dir = Path(args.data_dir)
-    srv.db_path = srv.data_dir / "wll.sqlite"
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # PID 1 in a container ignores SIG_DFL
+class CSVServer(http.server.ThreadingHTTPServer):
+    """Threaded HTTP server for CSVHandler, knowing where the data live."""
+
+    daemon_threads = True
+
+    def __init__(self, addr: tuple[str, int], data_dir: Path) -> None:
+        super().__init__(addr, CSVHandler)
+        self.data_dir = data_dir
+        self.db_path = data_dir / "wll.sqlite"
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    srv = CSVServer((args.bind, args.port), Path(args.data_dir))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # PID 1 in a container ignores SIG_DFL
     log.info("serving CSV extracts of %s on http://%s:%d/", srv.db_path, args.bind, args.port)
     try:
         srv.serve_forever()
@@ -1159,17 +1306,17 @@ def cmd_serve(args):
         srv.server_close()
 
 
-def env(name, default=None, cast=str):
+def env(name: str, default: Any = None, conv: Callable[[str], Any] = str) -> Any:
     v = os.environ.get(name)
-    return default if v in (None, "") else cast(v)
+    return default if v in (None, "") else conv(v)
 
 
-def env_bool(name, default):
+def env_bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
-    return default if v in (None, "") else v.strip().lower() in ("1", "true", "yes", "on")
+    return default if not v else v.strip().lower() in ("1", "true", "yes", "on")
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Davis WeatherLink Live local data harvester")
     p.add_argument("--log-level", default=env("WLL_LOG_LEVEL", "INFO"))
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1178,22 +1325,46 @@ def build_parser():
     r.add_argument("--host", default=env("WLL_HOST"), help="WLL IP or hostname [WLL_HOST]")
     r.add_argument("--port", type=int, default=env("WLL_PORT", 80, int), help="[WLL_PORT] 80")
     r.add_argument("--data-dir", default=env("WLL_DATA_DIR", "/data"), help="[WLL_DATA_DIR] /data")
-    r.add_argument("--interval", type=float, default=env("WLL_POLL_INTERVAL", 10.0, float),
-                   help="current_conditions poll interval, s, >= 10 [WLL_POLL_INTERVAL] 10")
-    r.add_argument("--timeout", type=float, default=env("WLL_HTTP_TIMEOUT", 8.0, float),
-                   help="HTTP timeout, s [WLL_HTTP_TIMEOUT] 8")
-    r.add_argument("--udp", action=argparse.BooleanOptionalAction, default=env_bool("WLL_UDP", True),
-                   help="request and record the 2.5 s UDP real-time stream [WLL_UDP] 1")
-    r.add_argument("--udp-port", type=int, default=env("WLL_UDP_PORT", 22222, int),
-                   help="[WLL_UDP_PORT] 22222")
-    r.add_argument("--rt-duration", type=int, default=env("WLL_RT_DURATION", 3600, int),
-                   help="duration of each real-time request, s; renewed at half [WLL_RT_DURATION] 3600")
-    r.add_argument("--raw", action=argparse.BooleanOptionalAction, default=env_bool("WLL_RAW", True),
-                   help="keep the raw JSON-lines archive [WLL_RAW] 1")
-    r.add_argument("--allow-fast-poll", action="store_true", default=env_bool("WLL_ALLOW_FAST_POLL", False),
-                   help="allow intervals < 10 s (only for tools/fake_wll.py)")
-    r.add_argument("--summary-period", type=int, default=SUMMARY_PERIOD,
-                   help="s per summary row [WLL_SUMMARY_PERIOD] 600")
+    r.add_argument(
+        "--interval",
+        type=float,
+        default=env("WLL_POLL_INTERVAL", 10.0, float),
+        help="current_conditions poll interval, s, >= 10 [WLL_POLL_INTERVAL] 10",
+    )
+    r.add_argument(
+        "--timeout",
+        type=float,
+        default=env("WLL_HTTP_TIMEOUT", 8.0, float),
+        help="HTTP timeout, s [WLL_HTTP_TIMEOUT] 8",
+    )
+    r.add_argument(
+        "--udp",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("WLL_UDP", True),
+        help="request and record the 2.5 s UDP real-time stream [WLL_UDP] 1",
+    )
+    r.add_argument("--udp-port", type=int, default=env("WLL_UDP_PORT", 22222, int), help="[WLL_UDP_PORT] 22222")
+    r.add_argument(
+        "--rt-duration",
+        type=int,
+        default=env("WLL_RT_DURATION", 3600, int),
+        help="duration of each real-time request, s; renewed at half [WLL_RT_DURATION] 3600",
+    )
+    r.add_argument(
+        "--raw",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("WLL_RAW", True),
+        help="keep the raw JSON-lines archive [WLL_RAW] 1",
+    )
+    r.add_argument(
+        "--allow-fast-poll",
+        action="store_true",
+        default=env_bool("WLL_ALLOW_FAST_POLL", False),
+        help="allow intervals < 10 s (only for tools/fake_wll.py)",
+    )
+    r.add_argument(
+        "--summary-period", type=int, default=SUMMARY_PERIOD, help="s per summary row [WLL_SUMMARY_PERIOD] 600"
+    )
     r.set_defaults(func=cmd_run)
 
     b = sub.add_parser("rebuild", help="regenerate a database (with summaries) from the raw archive")
@@ -1217,8 +1388,9 @@ def build_parser():
 
     e = sub.add_parser("export", help="write a table or view as CSV")
     e.add_argument("--db", default=os.path.join(env("WLL_DATA_DIR", "/data"), "wll.sqlite"))
-    e.add_argument("--table", default="summary_10min",
-                   help="e.g. summary_10min, iss_si, baro_si, inside_si, rt_iss_si, polls")
+    e.add_argument(
+        "--table", default="summary_10min", help="e.g. summary_10min, iss_si, baro_si, inside_si, rt_iss_si, polls"
+    )
     e.add_argument("--start", help="UTC, ISO 8601, inclusive (e.g. 2026-10-01 or 2026-10-01T06:00)")
     e.add_argument("--end", help="UTC, ISO 8601; a date includes that whole day, a time is exclusive")
     e.add_argument("-o", "--output", help="CSV file (default stdout)")
@@ -1237,13 +1409,16 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=args.log_level.upper(), stream=sys.stderr,
-                        format="%(asctime)sZ %(levelname)s %(message)s",
-                        datefmt="%Y-%m-%dT%H:%M:%S")
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        stream=sys.stderr,
+        format="%(asctime)sZ %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
     logging.Formatter.converter = time.gmtime
-    return args.func(args) or 0
+    return cast(int | None, args.func(args)) or 0
 
 
 if __name__ == "__main__":
