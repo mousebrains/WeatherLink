@@ -58,7 +58,7 @@ from typing import Any, TextIO, cast
 
 Json = dict[str, Any]
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 MIN_POLL_INTERVAL = 10.0  # documented limit for /v1/current_conditions
 MAX_RT_DURATION = 86400  # documented limit for /v1/real_time
 UDP_STALL = 30.0  # s of UDP silence before re-requesting broadcasts
@@ -218,7 +218,43 @@ SUMMARY_COLS = (
     ]
 )
 RAIN_GAP = 60.0  # s; rain increments count only between samples this close
+RESET_MAX_MM = 1.0  # a counter drop to at most this is the WLL's midnight reset
+GLITCH_SAMPLES = 3  # a lower reading seen this many times in a row becomes the baseline
+RETRY_DELAY = 1.5  # s before retrying a poll the WLL dropped (it serves one client at a time)
 SUMMARY_PERIOD = int(os.environ.get("WLL_SUMMARY_PERIOD") or 600)  # s
+
+
+class RainCounter:
+    """Turns the cumulative rainfall_daily counter (mm) into increments.
+
+    A drop to near zero is the WLL's reset at local midnight, and the new
+    value is rain since then. Any other drop is treated as a glitch and
+    ignored, keeping the higher reading as the reference so nothing is counted
+    twice when it comes back; if the lower reading persists, it becomes the new
+    baseline without being counted. Samples more than RAIN_GAP apart re-anchor
+    the counter without crediting rain, since its timing is unknown."""
+
+    def __init__(self) -> None:
+        self.t: float | None = None
+        self.ref = 0.0
+        self.low = 0
+
+    def step(self, t: float, mm: float) -> float | None:
+        """Rain since the previous sample, or None if it cannot be attributed."""
+        if self.t is None or t - self.t > RAIN_GAP:
+            self.t, self.ref, self.low = t, mm, 0
+            return None
+        self.t = t
+        if mm >= self.ref:
+            inc, self.ref, self.low = mm - self.ref, mm, 0
+            return inc
+        if mm <= RESET_MAX_MM:
+            self.ref, self.low = mm, 0
+            return mm
+        self.low += 1
+        if self.low >= GLITCH_SAMPLES:
+            self.ref, self.low = mm, 0
+        return 0.0
 
 
 def summary_table(period: int) -> str:
@@ -416,25 +452,25 @@ class Store:
         for view, pcs in views.items():
             cols = list(dict.fromkeys([c for _, c in pcs] + (ISS_EXTRA if view == "iss_si" else [])))
             lead = RAIN_GAP if view == "iss_si" else 0.0  # previous sample, for rain increments
-            prev_rain: tuple[float, float] | None = None
+            rain_counter = RainCounter()
             for r in self.db.execute(
                 f"SELECT recv_time, {', '.join(map(q, cols))} FROM {q(view)}"
                 " WHERE recv_time >= ? AND recv_time < ? ORDER BY recv_time",
                 (start - lead, end),
             ):
                 t, vals = r[0], dict(zip(cols, r[1:], strict=True))
-                if view == "iss_si":
-                    rain = vals["rainfall_daily_mm"]
-                    if rain is not None:
-                        if t >= start and prev_rain and t - prev_rain[0] <= RAIN_GAP:
-                            # rainfall_daily resets at the WLL's local midnight
-                            bins[key(t)]["rain_mm"].append(rain - prev_rain[1] if rain >= prev_rain[1] else rain)
-                        prev_rain = (t, rain)
+                if view == "iss_si" and vals["rainfall_daily_mm"] is not None:
+                    inc = rain_counter.step(t, vals["rainfall_daily_mm"])
+                    if inc is not None and t >= start:
+                        bins[key(t)]["rain_mm"].append(inc)
                 if t < start:
                     continue
                 b = bins[key(t)]
+                # While the ISS link is lost (rx_state 2) the WLL repeats its last
+                # values, so those samples count for rx_ok_frac but not the statistics.
+                lost = view == "iss_si" and vals["rx_state"] == 2
                 for prefix, col in pcs:
-                    if vals[col] is not None:
+                    if vals[col] is not None and not lost:
                         b[prefix].append(vals[col])
                 if view == "iss_si":
                     b["iss"].append(vals)
@@ -453,7 +489,8 @@ class Store:
             iss = v["iss"]
             rx = [s["rx_state"] for s in iss if s["rx_state"] is not None]
             row["rx_ok_frac"] = sum(x == 0 for x in rx) / len(rx) if rx else None
-            bat = [s["trans_battery_flag"] for s in iss if s["trans_battery_flag"] is not None]
+            fresh = [s for s in iss if s["rx_state"] != 2]
+            bat = [s["trans_battery_flag"] for s in fresh if s["trans_battery_flag"] is not None]
             row["battery_low"] = max(bat) if bat else None
             row["rain_mm"] = math.fsum(v["rain_mm"]) if v["rain_mm"] else None
             for prefix in SUMMARY_STATS:
@@ -462,7 +499,7 @@ class Store:
                 row.update(zip((f"{prefix}_{s}" for s in STAT_NAMES), stats, strict=True))
             wind = [
                 (s["wind_speed_last_ms"], s["wind_dir_last"])
-                for s in iss
+                for s in fresh
                 if s["wind_speed_last_ms"] is not None and s["wind_dir_last"] is not None
             ]
             moving = [d for sp, d in wind if sp > 0]
@@ -471,7 +508,7 @@ class Store:
             # steadiness is the resultant length, 1 = constant direction.
             row["wind_dir_mean_deg"], row["wind_dir_steadiness"] = vector_mean(moving)
             row["wind_vec_dir_deg"], row["wind_vec_ms"] = vector_mean([d for _, d in wind], [sp for sp, _ in wind])
-            last = iss[-1] if iss else {}
+            last = fresh[-1] if fresh else {}
             row["wll_wind_avg_10min_ms"] = last.get("wind_speed_avg_last_10_min_ms")
             row["wll_wind_dir_10min_deg"] = last.get("wind_dir_scalar_avg_last_10_min")
             row["wll_gust_10min_ms"] = last.get("wind_speed_hi_last_10_min_ms")
@@ -588,6 +625,15 @@ def utc_iso(t: float | None) -> str | None:
     return None if t is None else dt.datetime.fromtimestamp(t, dt.UTC).isoformat(timespec="seconds")
 
 
+def transient(err: str) -> bool:
+    """True for connection-level failures worth one quick retry (not timeouts,
+    HTTP errors or bad payloads)."""
+    return any(
+        s in err
+        for s in ("RemoteDisconnected", "Connection refused", "Connection reset", "IncompleteRead", "BadStatusLine")
+    )
+
+
 def noteworthy(n: int) -> bool:
     """Log the 1st, 3rd, 10th, 30th, ... and every 360th repeat of a failure."""
     return n in (1, 3, 10, 30, 100) or n % 360 == 0
@@ -609,7 +655,7 @@ class Harvester:
         # First summary period not yet written; run() catches up from the database.
         self.sum_from = math.floor(self.started / cfg.summary_period) * cfg.summary_period
         # HTTP polling
-        self.http_ok = self.http_fail = self.http_consec = 0
+        self.http_ok = self.http_fail = self.http_consec = self.http_retries = 0
         self.http_last_ok: float | None = None
         self.http_fail_since: float | None = None
         self.http_last_error: str | None = None
@@ -684,9 +730,18 @@ class Harvester:
     # -- HTTP current conditions --------------------------------------------
 
     def poll(self) -> None:
-        recv, latency, status, text, err = self.http_get("/v1/current_conditions")
-        err, data = self.record("http", self.meta(recv, "cc", status, latency, err), text)
-        self.hour_polls += 1
+        for attempt in (1, 2):
+            recv, latency, status, text, err = self.http_get("/v1/current_conditions")
+            err, data = self.record("http", self.meta(recv, "cc", status, latency, err), text)
+            self.hour_polls += 1
+            # The WLL drops or refuses a request while serving another client;
+            # one quick retry recovers that poll. Both attempts are recorded.
+            if attempt == 1 and err and transient(err) and not self.stopping:
+                self.http_retries += 1
+                log.debug("current_conditions dropped (%s); retrying in %g s", err, RETRY_DELAY)
+                time.sleep(RETRY_DELAY)
+                continue
+            break
         if err or data is None:
             err = err or "no data"
             self.http_fail += 1
@@ -836,6 +891,7 @@ class Harvester:
                 "ok": self.http_ok,
                 "fail": self.http_fail,
                 "consecutive_fail": self.http_consec,
+                "retried": self.http_retries,
                 "last_ok": utc_iso(self.http_last_ok),
                 "last_ok_epoch": self.http_last_ok,
                 "last_error": self.http_last_error,

@@ -98,11 +98,11 @@ row, with a low `n_polls`, until it is recomputed.
 
 | Columns | Meaning |
 |---|---|
-| `X_min`, `X_mean`, `X_median`, `X_max` | statistics of the 10 s samples, for each `X` in the table below |
-| `n_polls`, `n_failed` | successful and failed polls (60 = complete) |
+| `X_min`, `X_mean`, `X_median`, `X_max` | statistics of the 10 s samples, for each `X` in the table below. ISS samples taken while the radio link was lost (`rx_state` 2) are left out, because the WLL keeps repeating stale values then. |
+| `n_polls`, `n_failed` | successful and failed poll attempts (60 successes = complete). A connection the WLL drops is retried once after 1.5 s; both attempts are recorded. |
 | `rx_ok_frac` | fraction of samples with the ISS radio link fully synced (`rx_state` 0) |
-| `battery_low` | 1 if the ISS battery flag was set in any sample |
-| `rain_mm` | rain in the period. It is summed from increases in the `rainfall_daily` counter (which resets at the WLL's local midnight) between samples at most 60 s apart. Rain that falls during a longer gap is credited to no period, but still shows in the counters. |
+| `battery_low` | 1 if the ISS battery flag was set in any sample with a live link. It can flicker with solar charging, so judge it at night. |
+| `rain_mm` | rain in the period, from increases in the `rainfall_daily` counter. A drop to 1 mm or less is taken as the WLL's reset at local midnight. Any other drop is treated as a glitch and ignored, so a counter that dips and recovers is not counted twice; a lower reading that persists for 3 samples becomes the new baseline. Increases between samples more than 60 s apart (data gaps) are credited to no period, but still show in the counters. |
 | `wind_dir_mean_deg`, `wind_dir_steadiness` | mean of the wind directions treated as unit vectors, with calms excluded. Steadiness is 1 for a constant direction and near 0 for one that varies widely. Directions are where the wind comes from, in degrees. |
 | `wind_vec_ms`, `wind_vec_dir_deg`, `n_calm` | speed-weighted (vector) mean wind, and the number of calm samples |
 | `wll_wind_avg_10min_ms`, `wll_wind_dir_10min_deg`, `wll_gust_10min_ms`, `wll_gust_dir_10min_deg` | the WLL's own 10-minute statistics, from the period's last poll. These use every 2.5 s ISS sample, but their window runs about 1 minute behind the period. `wind_ms_max` is aligned to the period but sees only every 4th sample. |
