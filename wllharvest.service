@@ -1,0 +1,31 @@
+# wllharvest as a systemd service (VM or any Linux host).
+#
+#   sudo useradd --system --home /srv/wll --create-home wll
+#   sudo install -m 755 wllharvest.py /opt/wllharvest/wllharvest.py
+#   sudo cp wllharvest.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wllharvest
+#   journalctl -u wllharvest -f
+[Unit]
+Description=Davis WeatherLink Live data harvester
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=wll
+Environment=WLL_HOST=weatherlink.mousebrains.com
+Environment=WLL_DATA_DIR=/srv/wll
+# 1 adds the 2.5 s UDP wind/rain stream; needs this host on the WLL's subnet/VLAN.
+Environment=WLL_UDP=0
+ExecStart=/usr/bin/python3 -u /opt/wllharvest/wllharvest.py run
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/srv/wll
+
+[Install]
+WantedBy=multi-user.target

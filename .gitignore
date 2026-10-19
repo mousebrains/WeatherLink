@@ -2,3 +2,13 @@
 .*~
 *.db
 __pycache__
+
+# wllharvest data and local test runs
+data/
+range/
+*.sqlite
+*.sqlite-*
+*.jsonl
+*.jsonl.gz
+status.json
+.DS_Store
