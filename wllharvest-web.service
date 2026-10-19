@@ -1,0 +1,27 @@
+# Read-only CSV web page for wllharvest data (companion to wllharvest.service).
+#
+#   sudo cp wllharvest-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wllharvest-web
+#   then browse http://<host>:8580/
+[Unit]
+Description=WeatherLink Live data: CSV web page
+After=network-online.target wllharvest.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wll
+Environment=WLL_DATA_DIR=/srv/wll
+Environment=WLL_SERVE_PORT=8580
+ExecStart=/usr/bin/python3 -u /opt/wllharvest/wllharvest.py serve
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Writable only because SQLite may need to create its -shm file; the DB is opened read-only.
+ReadWritePaths=/srv/wll
+
+[Install]
+WantedBy=multi-user.target

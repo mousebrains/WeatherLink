@@ -1,0 +1,64 @@
+# wllharvest -- WeatherLink Live harvester as a Docker app (two containers:
+# the harvester, and a read-only web page serving CSV extracts).
+#
+# TrueNAS SCALE: run deploy_truenas.py (README), which fills in the paths and
+# installs this through the TrueNAS API. By hand: Apps -> Discover Apps ->
+# (three-dot menu) -> Install via YAML, after replacing /mnt/POOL/apps/wllharvest.
+# Anywhere else: `docker compose up -d` beside this file.
+services:
+  wllharvest:                        # keep this name: renaming would orphan the running container
+    image: python:3.13-slim          # stock image: the harvester is standard-library only
+    command: ["python", "-u", "/app/wllharvest.py", "run"]
+    user: "568:568"                  # TrueNAS 'apps' user; must be able to write /data
+    network_mode: host               # needed only for UDP broadcasts; harmless otherwise
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      WLL_HOST: "weatherlink.mousebrains.com"   # the WLL (give it a DHCP reservation)
+      WLL_POLL_INTERVAL: "10"        # s; 10 is the documented minimum
+      WLL_SUMMARY_PERIOD: "600"      # s; summary_10min table
+      # 2.5 s real-time wind/rain over UDP: off, the 10 s polls carry the same
+      # fields (and the WLL's own 10-minute wind statistics).
+      WLL_UDP: "0"
+      WLL_DATA_DIR: /data
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - /mnt/POOL/apps/wllharvest/code:/app:ro
+      - /mnt/POOL/apps/wllharvest/data:/data
+    healthcheck:
+      test: ["CMD", "python", "/app/wllharvest.py", "health", "--data-dir", "/data"]
+      interval: 60s
+      timeout: 15s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    image: python:3.13-slim
+    command: ["python", "-u", "/app/wllharvest.py", "serve"]
+    user: "568:568"
+    network_mode: host               # serves on the host's address: http://<nas>:8580/
+    restart: unless-stopped
+    environment:
+      WLL_SERVE_PORT: "8580"
+      WLL_SUMMARY_PERIOD: "600"      # must match the harvester's
+      WLL_DATA_DIR: /data
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:                         # the database is opened read-only
+      - /mnt/POOL/apps/wllharvest/code:/app:ro
+      - /mnt/POOL/apps/wllharvest/data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8580/', timeout=10)"]
+      interval: 60s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
