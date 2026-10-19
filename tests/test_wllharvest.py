@@ -6,6 +6,7 @@ The integration test runs the harvester against tools/fake_wll.py for ~15 s.
 import csv
 import gzip
 import io
+import itertools
 import json
 import math
 import os
@@ -373,6 +374,54 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(self.row(T0), first)
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM summary_10min").fetchone()[0], 1)
 
+    def test_lost_link_samples_are_left_out_of_statistics(self):
+        # A later period: 6 good samples at 10..15 C, then 4 with the link lost
+        # (rx_state 2) repeating a stale 99 C and a 50 mph "gust".
+        t1 = T0 + 1200
+        with self.store.transaction():
+            for i in range(10):
+                lost = i >= 6
+                self.store.ingest(
+                    iss_poll(t1 + 10 * i + 0.03, 99 if lost else 10 + i, 50 if lost else 2, 90, 4, rx=2 if lost else 0)
+                )
+        self.store.summarize(600, t1, t1 + 600)
+        r = self.row(t1)
+        self.assertEqual(r["n_polls"], 10)
+        self.assertAlmostEqual(r["rx_ok_frac"], 0.6)
+        self.assertAlmostEqual(r["temp_c_max"], 15.0)
+        self.assertAlmostEqual(r["temp_c_mean"], 12.5)
+        self.assertAlmostEqual(r["wind_ms_max"], 2 * 0.44704)
+        self.assertAlmostEqual(r["slp_hpa_mean"], 30.0 * 33.8638866667)  # barometer is not on the ISS link
+
+
+class RainCounterTests(unittest.TestCase):
+    def run_counter(self, samples):
+        c = wh.RainCounter()
+        return [c.step(t, mm) for t, mm in samples]
+
+    def test_increments_and_midnight_reset(self):
+        got = self.run_counter([(0, 2.0), (10, 2.254), (20, 2.254), (30, 0.0), (40, 0.254)])
+        self.assertEqual(got[0], None)  # first sample only anchors
+        self.assertAlmostEqual(got[1], 0.254)
+        self.assertEqual(got[2:4], [0.0, 0.0])  # reset to zero: no rain lost or invented
+        self.assertAlmostEqual(got[4], 0.254)
+
+    def test_backward_glitch_is_not_counted_twice(self):
+        got = self.run_counter([(0, 10.16), (10, 9.906), (20, 10.16), (30, 10.414)])
+        self.assertEqual(got[1:3], [0.0, 0.0])
+        self.assertAlmostEqual(got[3], 0.254)
+        self.assertAlmostEqual(sum(g for g in got if g), 0.254)
+
+    def test_persistent_drop_becomes_the_baseline(self):
+        got = self.run_counter([(0, 10.0), (10, 5.0), (20, 5.0), (30, 5.0), (40, 5.254)])
+        self.assertEqual(got[1:4], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(got[4], 0.254)
+
+    def test_gap_reanchors_without_crediting(self):
+        got = self.run_counter([(0, 1.0), (70, 3.0), (80, 3.254)])
+        self.assertEqual(got[1], None)
+        self.assertAlmostEqual(got[2], 0.254)
+
 
 class ServeTests(unittest.TestCase):
     def test_csv_endpoint(self):
@@ -512,6 +561,14 @@ class IntegrationTest(unittest.TestCase):
             self.assertIn("new field: added column iss.new_field_x", logtext)
             st = json.loads((data / "status.json").read_text())
             self.assertEqual((st["http"]["ok"], st["udp"]["packets"]), (n_ok, n_udp))
+            # A dropped connection is retried once, about RETRY_DELAY later, and succeeds.
+            self.assertGreaterEqual(st["http"]["retried"], 1)
+            seq = db.execute("SELECT recv_time, ok, error FROM polls ORDER BY recv_time").fetchall()
+            retries = [(a, b) for a, b in itertools.pairwise(seq) if not a[1] and "Disconnected" in a[2]]
+            self.assertTrue(retries)
+            for a, b in retries:
+                self.assertTrue(b[1], b)
+                self.assertLess(b[0] - a[0], 3)
             # Every packet arrived twice; copies are dropped before the archive.
             self.assertGreaterEqual(st["udp"]["duplicates_dropped"], n_udp - 1)
             udp_lines = list(wh.read_raw(sorted((data / "raw").glob("*/wll_udp_*"))))
