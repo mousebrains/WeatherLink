@@ -116,10 +116,32 @@ row, with a low `n_polls`, until it is recomputed.
 | `slp_hpa`, `station_p_hpa` | sea-level and station pressure |
 | `temp_in_c`, `rh_in` | temperature and humidity where the WLL sits |
 
-## CSV over HTTP (`serve`)
+## Dashboard and CSV over HTTP (`serve`)
 
-A second, read-only container serves a small page at `http://<host>:8580/`. It
-lets anyone on the LAN download CSV for a date range. Scripts can fetch the same data:
+A second, read-only container serves a dashboard at `http://<host>:8580/`, with CSV
+downloads and a small JSON API. There is no login, so it is meant for a trusted LAN.
+Don't forward the port to the internet.
+
+**Dashboard** (`/`):
+
+* **Status line:** data age, ISS radio link and battery.
+* **Tiles:** current conditions, plus today's high, low and strongest gust, with times.
+* **Range buttons:** 24 h, 7 days, 30 days and 1 year. The longer ranges use hourly or
+  daily bins, aligned to local midnight.
+* **Charts**, sharing one time cursor:
+  * temperature as a min–max band around the mean, with dew point
+  * humidity
+  * wind: mean, gust, and direction drawn as dots, so the 0/360° wrap makes no spikes
+  * rain per bin, with an accumulated line
+  * sea-level pressure
+  * solar radiation as a band, with peak UV
+  * data quality: polls answered and link synced
+
+Missing data shows as gaps. The page follows the browser's light or dark setting,
+works at phone width, and needs no internet access. Its chart library,
+[uPlot](https://github.com/leeoniya/uPlot) 1.6.32 (MIT), is served from `web/vendor/`.
+
+**CSV** (`/download` for a form, `/csv` for scripts):
 
 ```sh
 curl -OJ 'http://nas0.mousebrains.com:8580/csv?table=summary_10min&start=2026-10-01&end=2026-10-07'
@@ -130,10 +152,20 @@ curl -OJ 'http://nas0.mousebrains.com:8580/csv?table=summary_10min&start=2026-10
   * `iss_si`, `baro_si`, `inside_si` and `polls`: the 10 s data, at most 31 days per request.
 * **Dates:** ISO 8601 UTC. A date-only `end` includes that whole day; an end with a
   time is exclusive. With no `start`, the last 24 hours are returned.
-* **Other endpoints:** `/status.json` (harvester counters) and `/health`
-  (`OK`, or HTTP 503 with the reason).
 
-There is no login, so it is meant for a trusted LAN. Don't forward the port to the internet.
+**JSON**, as used by the dashboard:
+
+* `/api/latest`: the newest ISS, barometer and indoor records in SI units, plus `status.json`.
+* `/api/series?t0=…&t1=…&step=600&offset=…`: summary columns as arrays, one value per
+  `step` seconds, with `null` for missing bins.
+  * **Range:** `t0` and `t1` are epoch seconds; `start`/`end` in ISO 8601 also work.
+  * **Merging:** a `step` that is a multiple of 600 merges summaries. Minimums and maximums
+    carry through, means are weighted by polls, rain is summed, and wind directions are
+    combined as vectors.
+  * **Local days:** `offset` (seconds east of UTC) aligns daily bins to local midnight.
+
+**Other endpoints:** `/status.json` (harvester counters) and `/health` (`OK`, or HTTP 503
+with the reason).
 
 ## Deploy on TrueNAS SCALE
 
@@ -141,7 +173,7 @@ Copy the files to the NAS and run the install script with `sudo`. It runs on the
 NAS's own Python (3.11 on TrueNAS 25.10) and uses the TrueNAS API.
 
 ```sh
-scp wllharvest.py compose.yaml deploy_truenas.py nas0:wllharvest/
+scp -r wllharvest.py web compose.yaml deploy_truenas.py nas0:wllharvest/
 ssh -t nas0 'sudo python3 ~/wllharvest/deploy_truenas.py'   # defaults: --dataset SSD/WeatherLink --app wllharvest
 ```
 
@@ -261,7 +293,8 @@ python3 wllharvest.py status --data-dir ./range1 --hours 1             # % synce
 ## Files and testing
 
 ```
-wllharvest.py               harvester, summaries, CSV server, CLI (Python ≥ 3.13, standard library only)
+wllharvest.py               harvester, summaries, web server, CLI (Python ≥ 3.13, standard library only)
+web/                        dashboard page, script and styles; vendored uPlot
 compose.yaml                Docker / TrueNAS app: harvester + web containers
 deploy_truenas.py           TrueNAS install/upgrade via its API (runs on the NAS's Python 3.11)
 wllharvest*.service         systemd units for a VM

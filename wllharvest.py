@@ -58,7 +58,7 @@ from typing import Any, TextIO, cast
 
 Json = dict[str, Any]
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 MIN_POLL_INTERVAL = 10.0  # documented limit for /v1/current_conditions
 MAX_RT_DURATION = 86400  # documented limit for /v1/real_time
 UDP_STALL = 30.0  # s of UDP silence before re-requesting broadcasts
@@ -1208,6 +1208,129 @@ def cmd_health(args: argparse.Namespace) -> int:
 # CSV web service (read-only)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Dashboard data
+# ---------------------------------------------------------------------------
+
+# Summary columns the dashboard plots, and how each combines when summary rows
+# are merged into coarser bins (hourly or daily, for long ranges). Means are
+# weighted by n_polls; the wind columns are combined as vectors (see series()).
+SERIES_COLS: dict[str, str] = {
+    "n_polls": "sum",
+    "n_failed": "sum",
+    "rx_ok_frac": "wmean",
+    "battery_low": "max",
+    "rain_mm": "sum",
+    "rain_rate_mmh_max": "max",
+    "temp_c_min": "min",
+    "temp_c_mean": "wmean",
+    "temp_c_max": "max",
+    "dew_point_c_mean": "wmean",
+    "rh_mean": "wmean",
+    "wind_ms_mean": "wmean",
+    "wind_ms_max": "max",
+    "wll_gust_10min_ms": "max",
+    "wind_vec_ms": "vector",
+    "wind_vec_dir_deg": "vector",
+    "wind_dir_mean_deg": "unit",
+    "wind_dir_steadiness": "unit",
+    "slp_hpa_mean": "wmean",
+    "solar_wm2_min": "min",
+    "solar_wm2_mean": "wmean",
+    "solar_wm2_max": "max",
+    "uv_index_max": "max",
+    "temp_in_c_mean": "wmean",
+    "rh_in_mean": "wmean",
+}
+MAX_SERIES_BINS = 20000
+
+
+def weighted_vector(rows: Sequence[tuple[float | None, float | None, float]]) -> tuple[float | None, float | None]:
+    """(direction deg, magnitude) of sum(w * m * unit(d)) / sum(w) over (m, d, w);
+    a row with no direction contributes a zero vector (e.g. a calm period)."""
+    total = math.fsum(w for _, _, w in rows)
+    if not rows or total <= 0:
+        return None, None
+    x = math.fsum(w * (m or 0.0) * math.sin(math.radians(d)) for m, d, w in rows if d is not None) / total
+    y = math.fsum(w * (m or 0.0) * math.cos(math.radians(d)) for m, d, w in rows if d is not None) / total
+    mag = math.hypot(x, y)
+    return (round(math.degrees(math.atan2(x, y)), 3) % 360 if mag > 1e-12 else None), mag
+
+
+def combine(rows: Sequence[Json]) -> Json:
+    """Merge summary rows into one bin, per SERIES_COLS."""
+    if len(rows) == 1:
+        return rows[0]
+    out: Json = {}
+    weights = [r["n_polls"] or 0 for r in rows]
+    for col, how in SERIES_COLS.items():
+        vals = [(r[col], w) for r, w in zip(rows, weights, strict=True) if r[col] is not None]
+        if not vals or how in ("vector", "unit"):
+            out[col] = None
+        elif how == "sum":
+            out[col] = math.fsum(v for v, _ in vals)
+        elif how == "min":
+            out[col] = min(v for v, _ in vals)
+        elif how == "max":
+            out[col] = max(v for v, _ in vals)
+        else:  # weighted mean
+            total = sum(w for _, w in vals)
+            out[col] = math.fsum(v * w for v, w in vals) / total if total else statistics.fmean(v for v, _ in vals)
+    out["wind_vec_dir_deg"], out["wind_vec_ms"] = weighted_vector(
+        [
+            (r["wind_vec_ms"], r["wind_vec_dir_deg"], w)
+            for r, w in zip(rows, weights, strict=True)
+            if r["wind_vec_ms"] is not None
+        ]
+    )
+    # Unit-vector direction means combine weighted by their non-calm sample counts.
+    out["wind_dir_mean_deg"], out["wind_dir_steadiness"] = weighted_vector(
+        [
+            (r["wind_dir_steadiness"], r["wind_dir_mean_deg"], max(0, w - (r["n_calm"] or 0)))
+            for r, w in zip(rows, weights, strict=True)
+            if r["wind_dir_steadiness"] is not None
+        ]
+    )
+    return out
+
+
+def series(db: sqlite3.Connection, period: int, t0: float, t1: float, step: int, offset: int = 0) -> Json:
+    """Columnar summary data for charts: one value per `step` seconds in
+    [t0, t1), with bins aligned to local time via `offset` (s east of UTC)
+    and missing bins as None so charts show gaps. `step` must be a multiple
+    of the summary period."""
+    if step < period or step % period:
+        raise ValueError(f"step must be a multiple of {period} s")
+    first = int((t0 + offset) // step) * step - offset
+    n = math.ceil((t1 - first) / step)
+    if not 0 < n <= MAX_SERIES_BINS:
+        raise ValueError(f"range must give 1..{MAX_SERIES_BINS} bins of {step} s")
+    cols = [*SERIES_COLS, "n_calm"]
+    groups: collections.defaultdict[int, list[Json]] = collections.defaultdict(list)
+    table = summary_table(period)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone():
+        for r in db.execute(
+            f"SELECT t_start, {', '.join(map(q, cols))} FROM {q(table)} WHERE t_start >= ? AND t_start < ?",
+            (first, t1),
+        ):
+            groups[int((r[0] + offset) // step) * step - offset].append(dict(zip(cols, r[1:], strict=True)))
+    out: Json = {"step": step, "t": [first + i * step for i in range(n)]}
+    bins = [combine(groups[t]) if t in groups else {} for t in out["t"]]
+    for col in SERIES_COLS:
+        out[col] = [b.get(col) for b in bins]
+    return out
+
+
+def latest(db: sqlite3.Connection) -> Json:
+    """The newest record of each sensor view, in SI units."""
+    out: Json = {}
+    for name in ("iss", "baro", "inside"):
+        cur = db.execute(f"SELECT * FROM {q(name + '_si')} ORDER BY recv_time DESC LIMIT 1")
+        row = cur.fetchone()
+        out[name] = None if row is None else dict(zip([d[0] for d in cur.description], row, strict=True))
+    return out
+
+
 # Tables offered over HTTP: name -> (description, max days per request or None)
 SERVE_TABLES: dict[str, tuple[str, int | None]] = {
     summary_table(SUMMARY_PERIOD): (
@@ -1220,6 +1343,14 @@ SERVE_TABLES: dict[str, tuple[str, int | None]] = {
     "polls": ("every poll attempt: success or error, latency", 31),
 }
 DOCS_URL = "https://github.com/mousebrains/WeatherLink#readme"
+WEB_DIR = Path(__file__).resolve().parent / "web"  # dashboard page, scripts, styles
+STATIC_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+}
 
 
 class CSVHandler(http.server.BaseHTTPRequestHandler):
@@ -1240,11 +1371,28 @@ class CSVHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json(self, obj: Any) -> None:
+        body = json.dumps(obj, separators=(",", ":"), allow_nan=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         url = urllib.parse.urlparse(self.path)
         qs = {k: v[-1] for k, v in urllib.parse.parse_qs(url.query).items()}
         if url.path == "/":
+            return self.static("index.html")
+        if url.path.startswith("/static/"):
+            return self.static(urllib.parse.unquote(url.path[len("/static/") :]))
+        if url.path == "/download":
             return self.send_text(200, self.page(), "text/html; charset=utf-8")
+        if url.path == "/api/latest":
+            return self.api_latest()
+        if url.path == "/api/series":
+            return self.api_series(qs)
         if url.path == "/csv":
             return self.csv(qs)
         if url.path == "/health":
@@ -1258,6 +1406,50 @@ class CSVHandler(http.server.BaseHTTPRequestHandler):
             except OSError as e:
                 return self.send_text(503, f"no status: {e}\n")
         self.send_text(404, "not found; try / or /csv?table=...&start=YYYY-MM-DD&end=YYYY-MM-DD\n")
+
+    def static(self, rel: str) -> None:
+        """A file from the web directory, by extension; nothing outside it."""
+        root = self.srv.web_dir.resolve()
+        path = (root / rel).resolve()
+        if root not in path.parents or path.suffix not in STATIC_TYPES or not path.is_file():
+            return self.send_text(404, "not found\n")
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", STATIC_TYPES[path.suffix])
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400" if "vendor" in path.parts else "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def api_latest(self) -> None:
+        try:
+            status: Json | None = json.loads((self.srv.data_dir / "status.json").read_text())
+        except (OSError, ValueError):
+            status = None
+        with contextlib.closing(sqlite3.connect(f"file:{self.srv.db_path}?mode=ro", uri=True, timeout=30)) as db:
+            self.send_json({"status": status, **latest(db)})
+
+    def api_series(self, qs: dict[str, str]) -> None:
+        """Summary series: t0/t1 (epoch s) or start/end (ISO); step (s, default
+        the summary period); offset (s east of UTC) to align bins to local days."""
+        try:
+            if "t0" in qs or "t1" in qs:
+                t0, t1 = float(qs["t0"]), float(qs.get("t1", time.time()))
+            else:
+                start, end = parse_range(qs.get("start"), qs.get("end"))
+                t1 = time.time() if end is None else end
+                t0 = t1 - 86400 if start is None else start
+            step = int(qs.get("step", SUMMARY_PERIOD))
+            offset = int(qs.get("offset", 0))
+            if abs(offset) > 14 * 3600:
+                raise ValueError("offset must be within +-14 h")
+            with contextlib.closing(sqlite3.connect(f"file:{self.srv.db_path}?mode=ro", uri=True, timeout=30)) as db:
+                data = series(db, SUMMARY_PERIOD, t0, t1, step, offset)
+        except (KeyError, ValueError) as e:
+            return self.send_text(400, f"bad request: {e}\n")
+        except sqlite3.Error as e:
+            return self.send_text(500, f"error: {e}\n")
+        self.send_json(data)
 
     def csv(self, qs: dict[str, str]) -> None:
         table = qs.get("table", summary_table(SUMMARY_PERIOD))
@@ -1346,10 +1538,11 @@ class CSVServer(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, addr: tuple[str, int], data_dir: Path) -> None:
+    def __init__(self, addr: tuple[str, int], data_dir: Path, web_dir: Path = WEB_DIR) -> None:
         super().__init__(addr, CSVHandler)
         self.data_dir = data_dir
         self.db_path = data_dir / "wll.sqlite"
+        self.web_dir = web_dir
 
 
 def cmd_serve(args: argparse.Namespace) -> None:

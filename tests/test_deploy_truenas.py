@@ -5,7 +5,6 @@ which TrueNAS ships:  python3 -m unittest discover -s tests -p 'test_deploy*'
 """
 
 import json
-import os
 import sys
 import tempfile
 import time
@@ -110,17 +109,24 @@ class DeployTests(unittest.TestCase):
 
     def test_install_code_is_atomic_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            src, code = Path(d) / "wllharvest.py", Path(d) / "code"
+            src, code = Path(d) / "src", Path(d) / "code"
+            (src / "web" / "vendor").mkdir(parents=True)
             code.mkdir()
-            src.write_text("print('v1')\n")
+            (src / "wllharvest.py").write_text("print('v1')\n")
+            (src / "web" / "index.html").write_text("<p>v1</p>\n")
+            (src / "web" / "vendor" / "lib.js").write_text("lib\n")
+            self.assertEqual(
+                [str(p) for p in dep.code_files(src)], ["wllharvest.py", "web/index.html", "web/vendor/lib.js"]
+            )
             self.assertTrue(dep.install_code(src, code))
-            target = code / "wllharvest.py"
-            self.assertEqual(target.read_text(), "print('v1')\n")
-            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
-            self.assertFalse(dep.install_code(src, code))
-            src.write_text("print('v2')\n")
+            self.assertEqual((code / "web" / "vendor" / "lib.js").read_text(), "lib\n")
+            self.assertEqual((code / "wllharvest.py").stat().st_mode & 0o777, 0o644)
+            self.assertFalse(dep.install_code(src, code))  # nothing changed: no restart needed
+            (src / "web" / "index.html").write_text("<p>v2</p>\n")
             self.assertTrue(dep.install_code(src, code))
-            self.assertEqual(sorted(os.listdir(code)), ["wllharvest.py"])
+            self.assertEqual(
+                sorted(p.name for p in code.rglob("*")), ["index.html", "lib.js", "vendor", "web", "wllharvest.py"]
+            )
 
     def test_wait_fresh_needs_the_new_process(self) -> None:
         t_start = time.time()

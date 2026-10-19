@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Install or upgrade wllharvest as a TrueNAS SCALE custom app.
 
-Run as root on the NAS from a copy of this directory (it needs compose.yaml and
-wllharvest.py beside it):
+Run as root on the NAS from a copy of this directory (it needs compose.yaml,
+wllharvest.py and web/ beside it):
 
     sudo python3 deploy_truenas.py [--dataset SSD/WeatherLink] [--app wllharvest]
 
 Safe to re-run; that is also how to upgrade. It
   1. creates the dataset with TrueNAS's APPS preset if it does not exist,
   2. gives the user running sudo inheritable read access to the dataset,
-  3. installs wllharvest.py into <dataset>/code (read-only in the container),
+  3. installs wllharvest.py and web/ into <dataset>/code (read-only in the containers),
   4. makes <dataset>/data writable by the apps user (568) and checks access,
   5. creates the app from compose.yaml with the real paths; for an existing
      app it updates the compose config and/or restarts it only if the config
@@ -74,16 +74,27 @@ def grant_read(c: Any, path: Path, uid: int) -> str:
     return "added"
 
 
-def install_code(src: Path, code_dir: Path) -> bool:
-    """Atomically install src as code_dir/wllharvest.py; True if it changed."""
-    new, target = src.read_bytes(), code_dir / "wllharvest.py"
-    if target.exists() and target.read_bytes() == new:
-        return False
-    tmp = code_dir / ".wllharvest.py.tmp"
-    tmp.write_bytes(new)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, target)
-    return True
+def code_files(src_root: Path) -> list[Path]:
+    """What the containers run, relative to src_root: the harvester and the
+    dashboard's web directory."""
+    web = sorted(p.relative_to(src_root) for p in (src_root / "web").rglob("*") if p.is_file())
+    return [Path("wllharvest.py"), *web]
+
+
+def install_code(src_root: Path, code_dir: Path) -> bool:
+    """Atomically install code_files() into code_dir; True if any changed."""
+    changed = False
+    for rel in code_files(src_root):
+        new, target = (src_root / rel).read_bytes(), code_dir / rel
+        if target.exists() and target.read_bytes() == new:
+            continue
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.tmp")
+        tmp.write_bytes(new)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+        changed = True
+    return changed
 
 
 def deploy_app(c: Any, app: str, compose: str, code_changed: bool) -> str:
@@ -172,9 +183,9 @@ def main() -> None:
         if user:
             print(f"read access for uid {user[0]}: {grant_read(c, mnt, user[0])}")
 
-        code_changed = install_code(HERE / "wllharvest.py", code)
+        code_changed = install_code(HERE, code)
         target = code / "wllharvest.py"
-        print(f"{'installed' if code_changed else 'unchanged'} {target}; data in {data}")
+        print(f"code in {code}: {'updated' if code_changed else 'unchanged'}; data in {data}")
 
         probe, st_file = data / ".write_probe", data / "status.json"
         checks = [
