@@ -123,10 +123,10 @@ def main():
         restarted = True
         if c.call("app.query", [["name", "=", a.app]]):
             compose_changed = c.call("app.config", a.app) != yaml.safe_load(compose)
-            if compose_changed:   # recreates changed containers, which then load the new code
+            if compose_changed:   # TrueNAS force-recreates every container, loading the new code too
                 c.call("app.update", a.app, {"custom_compose_config_string": compose}, job=True, timeout=900)
                 print(f"updated app {a.app} (compose config changed)")
-            if code_changed:      # restart any container the update left alone
+            elif code_changed:
                 c.call("app.redeploy", a.app, job=True, timeout=900)
                 print(f"redeployed app {a.app} to load the new code")
             restarted = compose_changed or code_changed
