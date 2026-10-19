@@ -64,6 +64,11 @@ def main() -> int:
 
     iss = rows(f"{a.web}/csv?table=iss_si&start={since}")
     health = get(f"{a.web}/health")
+    page = get(f"{a.web}/")
+    script = get(f"{a.web}/static/app.js")
+    latest = json.loads(get(f"{a.web}/api/latest")[1] or "{}")
+    now = time.time()
+    series = json.loads(get(f"{a.web}/api/series?t0={now - 120}&t1={now}&step=5")[1] or "{}")
     raw = sorted(a.data_dir.glob("raw/*/wll_http_*.jsonl*"))
     checks = [
         ("harvester talks to the simulated WLL", st["did"] == FAKE_DID),
@@ -73,6 +78,10 @@ def main() -> int:
         ("summaries have statistics", all(r["temp_c_mean"] and int(r["n_polls"]) >= 1 for r in summary)),
         ("10 s data served", len(iss) >= 10 and all(r["temp_c"] for r in iss)),
         ("health endpoint OK", health == (200, "OK\n")),
+        ("dashboard page served", page[0] == 200 and "uPlot" in page[1]),
+        ("dashboard script served", script[0] == 200 and "api/series" in script[1]),
+        ("latest readings in SI", (latest.get("iss") or {}).get("temp_c") is not None),
+        ("chart series with data", any(v is not None for v in series.get("temp_c_mean", []))),
     ]
     for what, ok in checks:
         print(f"{'ok  ' if ok else 'FAIL'} {what}")

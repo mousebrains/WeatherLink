@@ -1,7 +1,9 @@
 # CI overrides for compose.yaml (container smoke test, see .github/workflows/ci.yml):
 # point the harvester at tools/fake_wll.py, poll every second, summarize every
-# 5 s, and mount the checkout and a scratch directory in place of the dataset.
-# Compose merges volumes by container path, so these replace /app and /data.
+# 5 s, mount the checkout and scratch directories in place of the dataset, and
+# give the proxy ordinary networking (no eno1np0 macvlan on CI runners) with
+# published ports and a self-signed certificate.
+# Compose merges volumes by container path, so these replace /app, /data, /certs.
 services:
   wllharvest:
     environment:
@@ -20,3 +22,17 @@ services:
     volumes:
       - ${WLL_CI_CODE:?set by the workflow}:/app:ro
       - ${WLL_CI_DATA:?set by the workflow}:/data
+
+  proxy:
+    networks: !override
+      internal: {}
+    ports:
+      - "18081:80"
+      - "18443:443"
+    volumes:
+      - ${WLL_CI_CODE:?set by the workflow}:/app:ro
+      - ${WLL_CI_CERTS:?set by the workflow}:/certs:ro
+
+networks:
+  lan: !override
+    driver: bridge

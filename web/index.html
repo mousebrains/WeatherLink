@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather</title>
+<link rel="stylesheet" href="static/vendor/uPlot.min.css">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<header>
+  <h1>Weather</h1>
+  <p id="status" class="status" role="status">Loading…</p>
+</header>
+<main>
+  <section id="tiles" class="tiles" aria-label="Current conditions"></section>
+  <p id="today" class="today" aria-label="Today so far"></p>
+  <nav class="ranges" aria-label="Chart time range">
+    <button type="button" data-days="1">24 h</button>
+    <button type="button" data-days="7">7 days</button>
+    <button type="button" data-days="30">30 days</button>
+    <button type="button" data-days="365">1 year</button>
+    <span id="range-note" class="range-note"></span>
+    <span class="units" role="group" aria-label="Units">
+      <button type="button" data-units="us">°F · mph · in</button>
+      <button type="button" data-units="si">°C · m/s · mm</button>
+    </span>
+  </nav>
+  <section id="charts" aria-label="Charts"></section>
+</main>
+<footer>
+  <a href="download">Download CSV</a> · <a href="status.json">Harvester status</a> ·
+  <a href="https://github.com/mousebrains/WeatherLink#readme">About the data</a>
+</footer>
+<script src="static/vendor/uPlot.iife.min.js"></script>
+<script src="static/app.js"></script>
+</body>
+</html>

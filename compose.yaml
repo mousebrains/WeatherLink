@@ -1,5 +1,8 @@
-# wllharvest -- WeatherLink Live harvester as a Docker app (two containers:
-# the harvester, and a read-only web page serving CSV extracts).
+# wllharvest -- WeatherLink Live harvester as a Docker app, three containers:
+#   wllharvest  polls the WLL, archives raw data, writes the database
+#   web         read-only dashboard, CSV and JSON on port 8580
+#   proxy       Traefik: https://weather.mousebrains.com on its own LAN address
+#               (macvlan, own MAC), in front of web, with a TrueNAS ACME certificate
 #
 # TrueNAS SCALE: run deploy_truenas.py (README), which fills in the paths and
 # installs this through the TrueNAS API. By hand: Apps -> Discover Apps ->
@@ -41,8 +44,10 @@ services:
     image: python:3.13-slim
     command: ["python", "-u", "/app/wllharvest.py", "serve"]
     user: "568:568"
-    network_mode: host               # serves on the host's address: http://<nas>:8580/
     restart: unless-stopped
+    networks: [internal]             # the proxy reaches it as http://web:8580
+    ports:
+      - "8580:8580"                  # and directly: http://nas0.mousebrains.com:8580/
     environment:
       WLL_SERVE_PORT: "8580"
       WLL_SUMMARY_PERIOD: "600"      # must match the harvester's
@@ -62,3 +67,52 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  proxy:
+    image: traefik:v3.7
+    user: "568:568"                  # binds 80/443 in its own network namespace
+    restart: unless-stopped
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.traefik.address=127.0.0.1:8082   # ping only, not reachable from the LAN
+      - --ping=true
+      - --providers.file.filename=/app/traefik.yml
+      - --log.level=INFO
+    networks:
+      lan:                           # its own address and MAC on the LAN (UniFi reservation)
+        ipv4_address: 172.22.222.47
+        mac_address: "02:57:4c:4c:00:01"
+        gw_priority: 1               # default route via the router, so replies reach other subnets
+      internal: {}
+    volumes:
+      - /mnt/POOL/apps/wllharvest/code:/app:ro
+      - /mnt/POOL/apps/wllharvest/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping", "--entrypoints.traefik.address=127.0.0.1:8082"]
+      interval: 60s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  internal: {}
+  lan:
+    # A macvlan network gives the proxy its own MAC and address on the LAN, so
+    # it can use ports 80/443 although TrueNAS's web UI holds them on the NAS's
+    # own address. (The NAS itself cannot reach this address; other hosts can.)
+    driver: macvlan
+    driver_opts:
+      parent: eno1np0
+    ipam:
+      config:
+        - subnet: 172.22.222.0/24
+          gateway: 172.22.222.122
+          ip_range: 172.22.222.47/32

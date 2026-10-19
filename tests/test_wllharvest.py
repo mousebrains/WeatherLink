@@ -423,6 +423,100 @@ class RainCounterTests(unittest.TestCase):
         self.assertAlmostEqual(got[2], 0.254)
 
 
+def summary_row(t_start, **cols):
+    """A summary_10min row with defaults for the dashboard's columns."""
+    row = {"t_start": t_start, "n_polls": 60, "n_failed": 0, "n_calm": 0}
+    row.update(cols)
+    return row
+
+
+class SeriesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = wh.Store(Path(self.tmp.name) / "t.sqlite")
+        self.db = self.store.db
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def put(self, *rows):
+        with self.store.transaction():
+            self.store._ensure_summary("summary_10min")
+            for r in rows:
+                self.db.execute(
+                    f"INSERT INTO summary_10min ({', '.join(r)}) VALUES ({', '.join('?' * len(r))})", list(r.values())
+                )
+
+    def test_bins_and_gaps(self):
+        self.put(summary_row(T0, temp_c_mean=10.0), summary_row(T0 + 1200, temp_c_mean=12.0))
+        d = wh.series(self.db, 600, T0 - 600, T0 + 1800, 600)
+        self.assertEqual(d["step"], 600)
+        self.assertEqual(d["t"], [T0 - 600, T0, T0 + 600, T0 + 1200])
+        self.assertEqual(d["temp_c_mean"], [None, 10.0, None, 12.0])  # missing periods stay gaps
+        self.assertEqual(set(d), {"step", "t", *wh.SERIES_COLS})
+
+    def test_hourly_merge(self):
+        self.put(
+            summary_row(
+                T0,
+                n_polls=60,
+                temp_c_min=5.0,
+                temp_c_mean=6.0,
+                temp_c_max=7.0,
+                rain_mm=0.254,
+                wind_vec_ms=2.0,
+                wind_vec_dir_deg=350.0,
+                wind_dir_mean_deg=350.0,
+                wind_dir_steadiness=1.0,
+            ),
+            summary_row(
+                T0 + 600,
+                n_polls=30,
+                temp_c_min=4.0,
+                temp_c_mean=9.0,
+                temp_c_max=10.0,
+                rain_mm=0.508,
+                wind_vec_ms=2.0,
+                wind_vec_dir_deg=10.0,
+                wind_dir_mean_deg=10.0,
+                wind_dir_steadiness=1.0,
+                n_calm=0,
+            ),
+        )
+        d = wh.series(self.db, 600, T0, T0 + 3600, 3600)
+        self.assertEqual(d["t"], [T0])
+        self.assertEqual((d["temp_c_min"][0], d["temp_c_max"][0]), (4.0, 10.0))
+        self.assertAlmostEqual(d["temp_c_mean"][0], (6.0 * 60 + 9.0 * 30) / 90)  # weighted by polls
+        self.assertAlmostEqual(d["rain_mm"][0], 0.762)
+        self.assertEqual(d["n_polls"][0], 90)
+        # 350 and 10 degrees combine to north (weights 60:30 pull it slightly west)
+        x = (60 * math.sin(math.radians(350)) + 30 * math.sin(math.radians(10))) / 90
+        y = (60 * math.cos(math.radians(350)) + 30 * math.cos(math.radians(10))) / 90
+        self.assertAlmostEqual(d["wind_vec_dir_deg"][0], round(math.degrees(math.atan2(x, y)), 3) % 360)
+        self.assertAlmostEqual(d["wind_vec_ms"][0], 2 * math.hypot(x, y))
+        self.assertGreater(d["wind_vec_dir_deg"][0], 350)
+
+    def test_daily_bins_follow_local_midnight(self):
+        offset = -7 * 3600  # e.g. PDT
+        local_midnight = T0 + 7 * 3600  # 2026-10-20 00:00 at UTC-7
+        self.put(summary_row(local_midnight - 600, rain_mm=1.0), summary_row(local_midnight, rain_mm=2.0))
+        d = wh.series(self.db, 600, local_midnight - 86400, local_midnight + 86400, 86400, offset)
+        self.assertEqual(d["t"], [local_midnight - 86400, local_midnight])
+        self.assertEqual(d["rain_mm"], [1.0, 2.0])
+
+    def test_bad_requests(self):
+        with self.assertRaises(ValueError):
+            wh.series(self.db, 600, T0, T0 + 3600, 900)  # not a whole number of periods
+        with self.assertRaises(ValueError):
+            wh.series(self.db, 600, T0, T0 + 600 * (wh.MAX_SERIES_BINS + 1), 600)
+
+    def test_empty_database(self):
+        d = wh.series(self.db, 600, T0, T0 + 1200, 600)
+        self.assertEqual(d["temp_c_mean"], [None, None])
+        self.assertEqual(wh.latest(self.db), {"iss": None, "baro": None, "inside": None})
+
+
 class ServeTests(unittest.TestCase):
     def test_csv_endpoint(self):
         import threading
@@ -462,9 +556,36 @@ class ServeTests(unittest.TestCase):
                 self.assertEqual(get("/csv?table=sqlite_master")[0], 400)
                 self.assertEqual(get("/csv?start=yesterday")[0], 400)
                 self.assertEqual(get("/csv?start=2026-10-20&end=2026-10-19")[0], 400)
-                code, body, _ = get("/")
+                code, body, _ = get("/download")
                 self.assertEqual(code, 200)
                 self.assertIn("Download CSV", body)
+                # Dashboard page, its files, and its data endpoints
+                code, body, hdr = get("/")
+                self.assertEqual((code, hdr["Content-Type"]), (200, "text/html; charset=utf-8"))
+                self.assertIn("static/vendor/uPlot.iife.min.js", body)
+                code, _, hdr = get("/static/app.js")
+                self.assertEqual((code, hdr["Content-Type"]), (200, "text/javascript; charset=utf-8"))
+                self.assertEqual(get("/static/vendor/uPlot.iife.min.js")[2]["Cache-Control"], "max-age=86400")
+                for bad in (
+                    "/static/../wllharvest.py",
+                    "/static/%2e%2e/wllharvest.py",
+                    "/static/vendor/uPlot.LICENSE",
+                    "/static/nope.js",
+                ):
+                    self.assertEqual(get(bad)[0], 404, bad)
+                code, body, _ = get("/api/latest")
+                latest = json.loads(body)
+                self.assertAlmostEqual(latest["iss"]["temp_c"], (44.2 - 32) / 1.8)
+                self.assertAlmostEqual(latest["baro"]["bar_sea_level_hpa"], 30.205 * 33.8638866667)
+                self.assertIsNone(latest["status"])  # no status.json in this test
+                code, body, _ = get("/api/series?t0=1792424400&t1=1792425600&step=600")
+                ser = json.loads(body)
+                self.assertEqual(ser["t"], [1792424400, 1792425000])
+                self.assertIsNotNone(ser["temp_c_mean"][0])
+                self.assertIsNone(ser["temp_c_mean"][1])
+                self.assertEqual(get("/api/series?t0=1792424400&t1=1792425600&step=900")[0], 400)
+                self.assertEqual(get("/api/series?t0=x")[0], 400)
+                self.assertEqual(get("/api/series?start=2026-10-19&end=2026-10-19")[0], 200)
                 self.assertEqual(get("/health")[0], 503)  # no status.json here
                 self.assertEqual(get("/nope")[0], 404)
             finally:

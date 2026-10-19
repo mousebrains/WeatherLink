@@ -116,10 +116,36 @@ row, with a low `n_polls`, until it is recomputed.
 | `slp_hpa`, `station_p_hpa` | sea-level and station pressure |
 | `temp_in_c`, `rh_in` | temperature and humidity where the WLL sits |
 
-## CSV over HTTP (`serve`)
+## Dashboard and CSV over HTTP (`serve`)
 
-A second, read-only container serves a small page at `http://<host>:8580/`. It
-lets anyone on the LAN download CSV for a date range. Scripts can fetch the same data:
+A second, read-only container serves a dashboard at `http://<host>:8580/`, with CSV
+downloads and a small JSON API. There is no login, so it is meant for a trusted LAN.
+Don't forward the port to the internet.
+
+**Dashboard** (`/`):
+
+* **Status line:** data age, ISS radio link and battery.
+* **Tiles:** current conditions, plus today's high, low and strongest gust, with times.
+* **Range buttons:** 24 h, 7 days, 30 days and 1 year. The longer ranges use hourly or
+  daily bins, aligned to local midnight.
+* **Charts**, sharing one time cursor:
+  * temperature as a min–max band around the mean, with dew point
+  * humidity
+  * wind: mean, gust, and direction drawn as dots, so the 0/360° wrap makes no spikes
+  * rain per bin, with an accumulated line
+  * sea-level pressure
+  * solar radiation as a band, with peak UV
+  * data quality: polls answered and link synced
+
+Units default to US customary (°F, mph, inches, inHg), and a toggle switches to metric
+(°C, m/s, mm, hPa); each browser remembers its choice. Only the display converts: the
+database, the CSV downloads and the API stay in SI units.
+
+Missing data shows as gaps. The page follows the browser's light or dark setting,
+works at phone width, and needs no internet access. Its chart library,
+[uPlot](https://github.com/leeoniya/uPlot) 1.6.32 (MIT), is served from `web/vendor/`.
+
+**CSV** (`/download` for a form, `/csv` for scripts):
 
 ```sh
 curl -OJ 'http://nas0.mousebrains.com:8580/csv?table=summary_10min&start=2026-10-01&end=2026-10-07'
@@ -130,10 +156,20 @@ curl -OJ 'http://nas0.mousebrains.com:8580/csv?table=summary_10min&start=2026-10
   * `iss_si`, `baro_si`, `inside_si` and `polls`: the 10 s data, at most 31 days per request.
 * **Dates:** ISO 8601 UTC. A date-only `end` includes that whole day; an end with a
   time is exclusive. With no `start`, the last 24 hours are returned.
-* **Other endpoints:** `/status.json` (harvester counters) and `/health`
-  (`OK`, or HTTP 503 with the reason).
 
-There is no login, so it is meant for a trusted LAN. Don't forward the port to the internet.
+**JSON**, as used by the dashboard:
+
+* `/api/latest`: the newest ISS, barometer and indoor records in SI units, plus `status.json`.
+* `/api/series?t0=…&t1=…&step=600&offset=…`: summary columns as arrays, one value per
+  `step` seconds, with `null` for missing bins.
+  * **Range:** `t0` and `t1` are epoch seconds; `start`/`end` in ISO 8601 also work.
+  * **Merging:** a `step` that is a multiple of 600 merges summaries. Minimums and maximums
+    carry through, means are weighted by polls, rain is summed, and wind directions are
+    combined as vectors.
+  * **Local days:** `offset` (seconds east of UTC) aligns daily bins to local midnight.
+
+**Other endpoints:** `/status.json` (harvester counters) and `/health` (`OK`, or HTTP 503
+with the reason).
 
 ## Deploy on TrueNAS SCALE
 
@@ -141,7 +177,7 @@ Copy the files to the NAS and run the install script with `sudo`. It runs on the
 NAS's own Python (3.11 on TrueNAS 25.10) and uses the TrueNAS API.
 
 ```sh
-scp wllharvest.py compose.yaml deploy_truenas.py nas0:wllharvest/
+scp -r wllharvest.py web traefik.yml compose.yaml deploy_truenas.py nas0:wllharvest/
 ssh -t nas0 'sudo python3 ~/wllharvest/deploy_truenas.py'   # defaults: --dataset SSD/WeatherLink --app wllharvest
 ```
 
@@ -171,6 +207,34 @@ replacing `/mnt/POOL/apps/wllharvest`.
 
 **On a VM or any Linux host:** use `wllharvest.service` and
 `wllharvest-web.service`. Their header comments list the commands.
+
+### HTTPS at `weather.mousebrains.com`
+
+The `proxy` container ([Traefik](https://traefik.io), official image) serves the dashboard at
+`https://weather.mousebrains.com`, and redirects plain HTTP to HTTPS.
+
+* **Its own address.** The proxy sits on a Docker *macvlan* network with its own MAC
+  (`02:57:4c:4c:00:01`) and address (172.22.222.47, a UniFi reservation). That matters
+  because TrueNAS's web interface holds ports 80 and 443 on the NAS's own address.
+  `tools/dhcp_probe.sh` (run with `sudo`) asks the DHCP server for a lease for that MAC,
+  so the router can pin it. One limit: Linux keeps a host and its macvlan containers
+  apart, so the NAS itself can't open `weather.mousebrains.com`; every other machine on
+  the LAN can. `web` sits on a private bridge network shared with the proxy, and is
+  still published on the NAS at port 8580.
+* **The certificate.** The certificate comes from TrueNAS's own ACME service. Create it
+  under Credentials → Certificates, named `Weather` (`--cert` selects another), with the same Cloudflare DNS
+  authenticator as the NAS's own certificate. The app holds no DNS API token.
+  `deploy_truenas.py` copies the certificate into `<dataset>/certs`, with mode 0400,
+  owned by the apps user, and with inherited ACL entries stripped. It also registers a
+  daily root cron job (03:17) that copies the files again when TrueNAS renews them, and
+  then restarts only the proxy. Until the certificate exists, Traefik serves a
+  self-signed one.
+* **Locking down the code.** `deploy_truenas.py` also strips the inherited ACL from
+  `<dataset>/code` and makes it root-owned. The APPS dataset preset grants
+  `builtin_users` read-write, so without this any local user could change what the
+  containers run.
+* **Moving it.** The site-specific values live in `compose.yaml` (`lan`: parent
+  interface, subnet, gateway, address) and `traefik.yml` (host name).
 
 ## Configuration
 
@@ -261,11 +325,14 @@ python3 wllharvest.py status --data-dir ./range1 --hours 1             # % synce
 ## Files and testing
 
 ```
-wllharvest.py               harvester, summaries, CSV server, CLI (Python ≥ 3.13, standard library only)
-compose.yaml                Docker / TrueNAS app: harvester + web containers
+wllharvest.py               harvester, summaries, web server, CLI (Python ≥ 3.13, standard library only)
+web/                        dashboard page, script and styles; vendored uPlot
+compose.yaml                Docker / TrueNAS app: harvester, web and proxy containers
+traefik.yml                 proxy routing and certificate paths
 deploy_truenas.py           TrueNAS install/upgrade via its API (runs on the NAS's Python 3.11)
 wllharvest*.service         systemd units for a VM
 tools/fake_wll.py           simulated WLL with fault injection
+tools/dhcp_probe.sh         asks the DHCP server for a lease for the proxy's MAC (run once)
 tests/                      unit, end-to-end, install-script and container smoke tests
 pyproject.toml              ruff and mypy settings
 .github/workflows/ci.yml    CI: lint, types, tests, container smoke test
@@ -292,7 +359,7 @@ running. They also check the ACL grant and the path substitution.
 | lint | `ruff check` and `ruff format --check`; `mypy` on the 3.13 code, with every shipped function annotated; `mypy --python-version 3.11 deploy_truenas.py` |
 | test | the unit and end-to-end tests on Python 3.13 and 3.14 (Linux) |
 | deploy-script | the install-script tests on Python 3.11, the TrueNAS host's version |
-| container | validates `compose.yaml`, then runs the real app on `python:3.13-slim` as user 568 against the simulator. It checks polls, summaries, the CSV and health endpoints, and a clean shutdown. |
+| container | validates `compose.yaml`, then runs the real app (harvester and web on `python:3.13-slim`, proxy on `traefik:v3.7`, as user 568) against the simulator, with the proxy on ordinary networking and a self-signed certificate. It checks polls, summaries, the dashboard and API, HTTPS through the proxy, the HTTP→HTTPS redirect, the health checks, and a clean shutdown. |
 
 The weekly run catches changes to the floating `python:3.13-slim` image before a
 TrueNAS redeploy pulls it.
