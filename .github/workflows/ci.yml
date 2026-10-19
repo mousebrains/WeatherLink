@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: compose.yaml floats on python:3.13-slim, and TrueNAS pulls the
+    # latest image on every redeploy, so catch an image change here first.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUFF_VERSION: "0.17.1"
+  MYPY_VERSION: "2.4.0"
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install "ruff==$RUFF_VERSION" "mypy==$MYPY_VERSION" types-PyYAML
+      - run: ruff check --output-format=github .
+      - run: ruff format --check .
+      - name: mypy (files and settings in pyproject.toml)
+        run: mypy
+      - name: mypy for deploy_truenas.py as Python 3.11 (the TrueNAS host's Python)
+        run: mypy --python-version 3.11 deploy_truenas.py
+
+  test:
+    name: tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pyyaml   # for the deploy_truenas.py tests
+      - run: python -W error::ResourceWarning -m unittest discover -s tests -v
+
+  deploy-script:
+    name: deploy_truenas.py tests on Python 3.11
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - run: python -W error::ResourceWarning -m unittest discover -s tests -p 'test_deploy*' -v
+
+  container:
+    name: container smoke test (compose.yaml on python:3.13-slim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Paths for the compose overrides
+        run: |
+          {
+            echo "WLL_CI_CODE=$GITHUB_WORKSPACE"
+            echo "WLL_CI_DATA=$RUNNER_TEMP/wll-data"
+            echo "COMPOSE=docker compose -f compose.yaml -f tests/compose.ci.yaml"
+          } >> "$GITHUB_ENV"
+      - name: Validate compose.yaml
+        run: docker compose -f compose.yaml config --quiet
+      - name: Start the simulated WLL
+        run: |
+          nohup python tools/fake_wll.py --bind 127.0.0.1 --port 18080 \
+            --udp-target 127.0.0.1:22222 > "$RUNNER_TEMP/fake_wll.log" 2>&1 &
+      - name: Start the app (harvester + web, as the apps user 568)
+        run: |
+          mkdir -p "$WLL_CI_DATA" && chmod 777 "$WLL_CI_DATA"
+          $COMPOSE up -d
+      - name: Check polls, summaries and the CSV service
+        run: python tests/smoke_container.py --data-dir "$WLL_CI_DATA" --web http://127.0.0.1:8580 --timeout 120
+      - name: Stop and check for a clean shutdown
+        run: |
+          $COMPOSE stop
+          for s in wllharvest web; do
+            code=$(docker inspect --format '{{.State.ExitCode}}' "$($COMPOSE ps -a -q "$s")")
+            echo "$s exited with code $code"
+            test "$code" = 0
+          done
+          $COMPOSE logs wllharvest | grep "stopped ("
+      - name: Logs
+        if: always()
+        run: |
+          $COMPOSE logs || true
+          cat "$RUNNER_TEMP/fake_wll.log" || true

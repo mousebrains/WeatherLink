@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
 from urllib.parse import parse_qs, urlparse
 
 DID = "001D0A7FFFFF"
@@ -39,23 +40,47 @@ class Weather:
         wind = max(0.0, 4 + 3 * math.sin(t / 60) + random.gauss(0, 1))
         wdir = int(270 + 30 * math.sin(t / 300)) % 360 or 360
         return {
-            "lsid": 235347, "data_structure_type": 1, "txid": 1,
-            "temp": round(temp, 1), "hum": 80.0, "dew_point": round(temp - 4, 1),
-            "wet_bulb": round(temp - 2, 1), "heat_index": round(temp, 1),
-            "wind_chill": round(temp, 1), "thw_index": round(temp, 1), "thsw_index": round(temp, 1),
-            "wind_speed_last": round(wind, 1), "wind_dir_last": wdir,
-            "wind_speed_avg_last_1_min": 4.0, "wind_dir_scalar_avg_last_1_min": 270,
-            "wind_speed_avg_last_2_min": 4.0, "wind_dir_scalar_avg_last_2_min": 270,
-            "wind_speed_hi_last_2_min": 7.0, "wind_dir_at_hi_speed_last_2_min": 268,
-            "wind_speed_avg_last_10_min": 4.18, "wind_dir_scalar_avg_last_10_min": 270,
-            "wind_speed_hi_last_10_min": 9.0, "wind_dir_at_hi_speed_last_10_min": 269,
-            "rain_size": 1, "rain_rate_last": 0, "rain_rate_hi": 0,
-            "rainfall_last_15_min": 0, "rain_rate_hi_last_15_min": 0,
-            "rainfall_last_60_min": 0, "rainfall_last_24_hr": rain, "rain_storm": rain,
-            "rain_storm_start_at": None, "solar_rad": 56, "uv_index": 0.0,
-            "rx_state": 0, "trans_battery_flag": 0, "rainfall_daily": rain,
-            "rainfall_monthly": 20 + rain, "rainfall_year": 20 + rain,
-            "rain_storm_last": 15, "rain_storm_last_start_at": 1791672301,
+            "lsid": 235347,
+            "data_structure_type": 1,
+            "txid": 1,
+            "temp": round(temp, 1),
+            "hum": 80.0,
+            "dew_point": round(temp - 4, 1),
+            "wet_bulb": round(temp - 2, 1),
+            "heat_index": round(temp, 1),
+            "wind_chill": round(temp, 1),
+            "thw_index": round(temp, 1),
+            "thsw_index": round(temp, 1),
+            "wind_speed_last": round(wind, 1),
+            "wind_dir_last": wdir,
+            "wind_speed_avg_last_1_min": 4.0,
+            "wind_dir_scalar_avg_last_1_min": 270,
+            "wind_speed_avg_last_2_min": 4.0,
+            "wind_dir_scalar_avg_last_2_min": 270,
+            "wind_speed_hi_last_2_min": 7.0,
+            "wind_dir_at_hi_speed_last_2_min": 268,
+            "wind_speed_avg_last_10_min": 4.18,
+            "wind_dir_scalar_avg_last_10_min": 270,
+            "wind_speed_hi_last_10_min": 9.0,
+            "wind_dir_at_hi_speed_last_10_min": 269,
+            "rain_size": 1,
+            "rain_rate_last": 0,
+            "rain_rate_hi": 0,
+            "rainfall_last_15_min": 0,
+            "rain_rate_hi_last_15_min": 0,
+            "rainfall_last_60_min": 0,
+            "rainfall_last_24_hr": rain,
+            "rain_storm": rain,
+            "rain_storm_start_at": None,
+            "solar_rad": 56,
+            "uv_index": 0.0,
+            "rx_state": 0,
+            "trans_battery_flag": 0,
+            "rainfall_daily": rain,
+            "rainfall_monthly": 20 + rain,
+            "rainfall_year": 20 + rain,
+            "rain_storm_last": 15,
+            "rain_storm_last_start_at": 1791672301,
             "rain_storm_last_end_at": 1791820860,
         }
 
@@ -72,12 +97,25 @@ class FakeWLL(ThreadingHTTPServer):
         self.lock = threading.Lock()
 
     def conditions(self, t):
-        recs = [self.weather.iss(t),
-                {"lsid": 235345, "data_structure_type": 4, "temp_in": 72.0, "hum_in": 58.6,
-                 "dew_point_in": 56.7, "heat_index_in": 71.9},
-                {"lsid": 235344, "data_structure_type": 3, "bar_sea_level": 30.205,
-                 "bar_trend": 0.016, "bar_absolute": 29.85}]
-        if self.opts.quirks:   # what a future firmware might add
+        recs = [
+            self.weather.iss(t),
+            {
+                "lsid": 235345,
+                "data_structure_type": 4,
+                "temp_in": 72.0,
+                "hum_in": 58.6,
+                "dew_point_in": 56.7,
+                "heat_index_in": 71.9,
+            },
+            {
+                "lsid": 235344,
+                "data_structure_type": 3,
+                "bar_sea_level": 30.205,
+                "bar_trend": 0.016,
+                "bar_absolute": 29.85,
+            },
+        ]
+        if self.opts.quirks:  # what a future firmware might add
             recs[0]["new_field_x"] = 1.5
             recs.append({"lsid": 999, "data_structure_type": 99, "mystery": [1, 2]})
         return recs
@@ -90,14 +128,31 @@ class FakeWLL(ThreadingHTTPServer):
             t = time.time()
             if t < self.rt_end:
                 iss = self.weather.iss(t)
-                pkt = {"did": DID, "ts": int(t), "conditions": [{
-                    "lsid": 235347, "data_structure_type": 1, "txid": 1,
-                    "wind_speed_last": iss["wind_speed_last"], "wind_dir_last": iss["wind_dir_last"],
-                    "rain_size": 1, "rain_rate_last": 0, "rain_15_min": 0, "rain_60_min": 0,
-                    "rain_24_hr": iss["rainfall_daily"], "rain_storm": iss["rain_storm"],
-                    "rain_storm_start_at": 0, "rainfall_daily": iss["rainfall_daily"],
-                    "rainfall_monthly": iss["rainfall_monthly"], "rainfall_year": iss["rainfall_year"],
-                    "wind_speed_hi_last_10_min": 9.0, "wind_dir_at_hi_speed_last_10_min": 269}]}
+                pkt = {
+                    "did": DID,
+                    "ts": int(t),
+                    "conditions": [
+                        {
+                            "lsid": 235347,
+                            "data_structure_type": 1,
+                            "txid": 1,
+                            "wind_speed_last": iss["wind_speed_last"],
+                            "wind_dir_last": iss["wind_dir_last"],
+                            "rain_size": 1,
+                            "rain_rate_last": 0,
+                            "rain_15_min": 0,
+                            "rain_60_min": 0,
+                            "rain_24_hr": iss["rainfall_daily"],
+                            "rain_storm": iss["rain_storm"],
+                            "rain_storm_start_at": 0,
+                            "rainfall_daily": iss["rainfall_daily"],
+                            "rainfall_monthly": iss["rainfall_monthly"],
+                            "rainfall_year": iss["rainfall_year"],
+                            "wind_speed_hi_last_10_min": 9.0,
+                            "wind_dir_at_hi_speed_last_10_min": 269,
+                        }
+                    ],
+                }
                 for _ in range(self.opts.udp_copies):
                     s.sendto(json.dumps(pkt).encode(), (host, int(port)))
             time.sleep(2.5)
@@ -119,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(code, {"data": None, "error": {"code": code, "message": msg}})
 
     def do_GET(self):
-        srv, url, t = self.server, urlparse(self.path), time.time()
+        srv, url, t = cast(FakeWLL, self.server), urlparse(self.path), time.time()
         if url.path == "/v1/current_conditions":
             with srv.lock:
                 srv.cc_count += 1
@@ -135,8 +190,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
                 time.sleep(srv.opts.slow)
-            return self.reply(200, {"data": {"did": DID, "ts": int(t),
-                                             "conditions": srv.conditions(t)}, "error": None})
+            return self.reply(200, {"data": {"did": DID, "ts": int(t), "conditions": srv.conditions(t)}, "error": None})
         if url.path == "/v1/real_time":
             try:
                 dur = int(parse_qs(url.query).get("duration", ["1200"])[0])
@@ -144,7 +198,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error(400, "Bad Request")
             if not 0 < dur <= 86400:
                 return self.error(400, "Bad Request")
-            with srv.lock:   # shorter requests are ignored, longer ones reset the end
+            with srv.lock:  # shorter requests are ignored, longer ones reset the end
                 srv.rt_end = max(srv.rt_end, t + dur)
                 left = int(srv.rt_end - t)
             return self.reply(200, {"data": {"broadcast_port": 22222, "duration": left}, "error": None})
@@ -156,12 +210,17 @@ def main():
     p.add_argument("--bind", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--udp-target", default="255.255.255.255:22222", help="host:port for UDP packets")
-    p.add_argument("--fault-every", type=int, default=0,
-                   help="every Nth current_conditions request fails, cycling " + ", ".join(FAULTS))
+    p.add_argument(
+        "--fault-every",
+        type=int,
+        default=0,
+        help="every Nth current_conditions request fails, cycling " + ", ".join(FAULTS),
+    )
     p.add_argument("--slow", type=float, default=10.0, help="delay for the 'slow' fault, s")
     p.add_argument("--quirks", action="store_true", help="add an unknown field and record type")
-    p.add_argument("--udp-copies", type=int, default=1,
-                   help="send each UDP packet N times (mimics a dual-homed receiver)")
+    p.add_argument(
+        "--udp-copies", type=int, default=1, help="send each UDP packet N times (mimics a dual-homed receiver)"
+    )
     opts = p.parse_args()
     srv = FakeWLL((opts.bind, opts.port), opts)
     threading.Thread(target=srv.udp_loop, daemon=True).start()

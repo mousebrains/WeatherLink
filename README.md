@@ -1,5 +1,7 @@
 # WeatherLink — local data harvester for a Davis WeatherLink Live
 
+[![CI](https://github.com/mousebrains/WeatherLink/actions/workflows/ci.yml/badge.svg)](https://github.com/mousebrains/WeatherLink/actions/workflows/ci.yml)
+
 `wllharvest` records everything a Davis WeatherLink Live (WLL) reports on its
 [local API](https://weatherlink.github.io/weatherlink-live-local-api/).
 It also builds 10-minute summaries and serves CSV extracts over HTTP. It
@@ -199,6 +201,7 @@ python3 wllharvest.py summarize --db data/wll.sqlite --period 3600              
 
 ```python
 import pandas as pd
+
 s = pd.read_csv("http://nas0.mousebrains.com:8580/csv?start=2026-10-01&end=2026-10-07")
 s.index = pd.to_datetime(s.t_start, unit="s", utc=True)
 ```
@@ -258,22 +261,48 @@ python3 wllharvest.py status --data-dir ./range1 --hours 1             # % synce
 ## Files and testing
 
 ```
-wllharvest.py            harvester, summaries, CSV server, CLI (Python ≥ 3.13, standard library only)
-compose.yaml             Docker / TrueNAS app: harvester + web containers
-deploy_truenas.py        TrueNAS install/upgrade via its API (runs on the NAS's Python 3.11)
-wllharvest*.service      systemd units for a VM
-tools/fake_wll.py        simulated WLL with fault injection
-tests/                   python3 -m unittest discover -s tests
+wllharvest.py               harvester, summaries, CSV server, CLI (Python ≥ 3.13, standard library only)
+compose.yaml                Docker / TrueNAS app: harvester + web containers
+deploy_truenas.py           TrueNAS install/upgrade via its API (runs on the NAS's Python 3.11)
+wllharvest*.service         systemd units for a VM
+tools/fake_wll.py           simulated WLL with fault injection
+tests/                      unit, end-to-end, install-script and container smoke tests
+pyproject.toml              ruff and mypy settings
+.github/workflows/ci.yml    CI: lint, types, tests, container smoke test
 ```
 
-The tests run in about 20 s and include an end-to-end run. The unit tests use a
-verbatim response from a real WLL, plus synthetic periods with known statistics
-(rain-counter resets, data gaps, wind directions on either side of north).
+The unit tests use a real WLL response (with Davis's documentation device ID
+substituted), plus synthetic periods with known statistics: rain-counter resets,
+data gaps, and wind directions on either side of north.
 
 The end-to-end test runs the harvester against the simulator. The simulator
 injects HTTP 500s, malformed JSON, dropped connections, timeouts, duplicate UDP
 packets, an unknown field and an unknown record type. The test checks that all of
 these were recorded, that SIGTERM shuts the harvester down cleanly, and that the raw
-archive rebuilds an identical database. Tested on Python 3.13 and 3.14.
+archive rebuilds an identical database.
+
+The install-script tests use a fake TrueNAS API client. They check which changes
+trigger an app create, update or restart, and that an unchanged app is left
+running. They also check the ACL grant and the path substitution.
+
+**CI** runs on every push and pull request, and weekly:
+
+| Job | What it runs |
+|---|---|
+| lint | `ruff check` and `ruff format --check`; `mypy` on the 3.13 code, with every shipped function annotated; `mypy --python-version 3.11 deploy_truenas.py` |
+| test | the unit and end-to-end tests on Python 3.13 and 3.14 (Linux) |
+| deploy-script | the install-script tests on Python 3.11, the TrueNAS host's version |
+| container | validates `compose.yaml`, then runs the real app on `python:3.13-slim` as user 568 against the simulator. It checks polls, summaries, the CSV and health endpoints, and a clean shutdown. |
+
+The weekly run catches changes to the floating `python:3.13-slim` image before a
+TrueNAS redeploy pulls it.
+
+To run the same checks locally:
+
+```sh
+python3 -m unittest discover -s tests          # ~20 s; PyYAML needed for the install-script tests
+uvx ruff check . && uvx ruff format --check .
+uvx --with types-PyYAML mypy && uvx --with types-PyYAML mypy --python-version 3.11 deploy_truenas.py
+```
 
 The license is GPL-3.0.

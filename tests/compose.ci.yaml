@@ -1,0 +1,22 @@
+# CI overrides for compose.yaml (container smoke test, see .github/workflows/ci.yml):
+# point the harvester at tools/fake_wll.py, poll every second, summarize every
+# 5 s, and mount the checkout and a scratch directory in place of the dataset.
+# Compose merges volumes by container path, so these replace /app and /data.
+services:
+  wllharvest:
+    environment:
+      WLL_HOST: "127.0.0.1"
+      WLL_PORT: "18080"
+      WLL_POLL_INTERVAL: "1"
+      WLL_ALLOW_FAST_POLL: "1"
+      WLL_SUMMARY_PERIOD: "5"
+    volumes:
+      - ${WLL_CI_CODE:?set by the workflow}:/app:ro
+      - ${WLL_CI_DATA:?set by the workflow}:/data
+
+  web:
+    environment:
+      WLL_SUMMARY_PERIOD: "5"
+    volumes:
+      - ${WLL_CI_CODE:?set by the workflow}:/app:ro
+      - ${WLL_CI_DATA:?set by the workflow}:/data
