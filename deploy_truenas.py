@@ -271,9 +271,8 @@ def main() -> None:
             if cert and cert[0].get("certificate_path") and cert[0].get("privatekey_path"):
                 command = cert_sync_command(cert[0]["certificate_path"], cert[0]["privatekey_path"], certs, a.app)
                 subprocess.run(["sh", "-c", command], check=False)
-                print(
-                    f"certificate {a.cert!r} synced to {certs} (copied only if changed); daily copy job {ensure_cron(c, command)}"
-                )
+                job = ensure_cron(c, command)
+                print(f"certificate {a.cert!r} synced to {certs} (copied only if changed); daily copy job {job}")
             else:
                 print(f"WARNING: no TrueNAS certificate named {a.cert!r} yet; the proxy serves a self-signed")
                 print("         certificate until it exists and this script is run again")
